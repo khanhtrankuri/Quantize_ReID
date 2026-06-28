@@ -25,7 +25,7 @@ Download the datasets ([Market-1501](https://drive.google.com/file/d/0B8-rUzbwVR
 
 ### Training
 
-For example, if you want to run CNN-based CLIP-ReID-baseline for the Market-1501, you need to modify the bottom of configs/person/cnn_base.yml to
+Before training, update the dataset and output path in the config file that you want to use. For example, for Market-1501:
 
 ```
 DATASETS:
@@ -34,22 +34,40 @@ DATASETS:
 OUTPUT_DIR: 'your_output_dir'
 ```
 
-then run 
+On Linux:
 
 ```
 CUDA_VISIBLE_DEVICES=0 python train.py --config_file configs/person/cnn_base.yml
 ```
 
-if you want to run ViT-based CLIP-ReID for MSMT17, you need to modify the bottom of configs/person/vit_clipreid.yml to
+On Windows PowerShell:
 
 ```
-DATASETS:
-   NAMES: ('msmt17')
-   ROOT_DIR: ('your_dataset_dir')
-OUTPUT_DIR: 'your_output_dir'
+$env:CUDA_VISIBLE_DEVICES="0"
+python train.py --config_file configs/person/cnn_base.yml
 ```
 
-then run 
+Common training commands:
+
+CNN baseline:
+
+```
+CUDA_VISIBLE_DEVICES=0 python train.py --config_file configs/person/cnn_base.yml
+```
+
+ViT baseline:
+
+```
+CUDA_VISIBLE_DEVICES=0 python train.py --config_file configs/person/vit_base.yml
+```
+
+CNN CLIP-ReID:
+
+```
+CUDA_VISIBLE_DEVICES=0 python train_clipreid.py --config_file configs/person/cnn_clipreid.yml
+```
+
+ViT CLIP-ReID:
 
 ```
 CUDA_VISIBLE_DEVICES=0 python train_clipreid.py --config_file configs/person/vit_clipreid.yml
@@ -61,12 +79,100 @@ if you want to run ViT-based CLIP-ReID+SIE+OLP for MSMT17, run:
 CUDA_VISIBLE_DEVICES=0 python train_clipreid.py --config_file configs/person/vit_clipreid.yml  MODEL.SIE_CAMERA True MODEL.SIE_COE 1.0 MODEL.STRIDE_SIZE '[12, 12]'
 ```
 
+After training, checkpoints are saved under `OUTPUT_DIR`. For CLIP-ReID, the usual files are:
+
+```
+ViT-B-16_stage1_120.pth
+ViT-B-16_60.pth
+RN50_stage1_60.pth
+RN50_120.pth
+```
+
+The exact epoch number depends on `SOLVER.STAGE1.MAX_EPOCHS`, `SOLVER.STAGE2.MAX_EPOCHS`, and the checkpoint period in the config.
+
+### Quantization-aware finetuning
+
+This repository includes QAT modules for CLIP-ReID in `model/clip/qat_layers.py` and `model/clip/apply_qat_clip.py`. Use QAT after you already have a normal FP32 checkpoint.
+
+Important flow:
+
+```
+train FP32 model -> load checkpoint -> patch QAT modules -> calibrate observers -> QAT finetune -> save QAT checkpoint
+```
+
+Do not train from scratch with `MODEL.QAT.ENABLED: True` when loading an old FP32 checkpoint directly, because QAT modules use different `state_dict` keys. The script `quantize_fineturn.py` handles the correct order automatically.
+
+Example for ViT CLIP-ReID on Market-1501:
+
+```
+CUDA_VISIBLE_DEVICES=0 python quantize_fineturn.py \
+  --config_file configs/person/vit_clipreid.yml \
+  --weight output/market1501_vit_qat/ViT-B-16_60.pth \
+  --qat_epochs 5 \
+  --qat_lr 1e-6 \
+  --calib_batches 50
+```
+
+Windows PowerShell:
+
+```
+$env:CUDA_VISIBLE_DEVICES="0"
+python quantize_fineturn.py `
+  --config_file configs/person/vit_clipreid.yml `
+  --weight output/market1501_vit_qat/ViT-B-16_60.pth `
+  --qat_epochs 5 `
+  --qat_lr 1e-6 `
+  --calib_batches 50
+```
+
+Useful QAT options:
+
+```
+--weight                       FP32 checkpoint to quantize and finetune
+--qat_epochs                   number of QAT finetuning epochs
+--qat_lr                       small learning rate for QAT, default 1e-6
+--calib_batches                batches used to calibrate observers before finetuning
+--disable_observer_epoch       epoch to freeze observer scale/zero-point
+--quantize_attention_internals optionally quantize attention matmul internals
+--eval_before                  evaluate after QAT patch/calibration and before finetuning
+```
+
+Recommended config values for QAT are already present in the CLIP-ReID config files:
+
+```
+MODEL:
+  QAT:
+    ENABLED: False
+    QUANTIZE_ATTENTION_INTERNALS: False
+    DISABLE_OBSERVER_EPOCH: 2
+```
+
+`MODEL.QAT.ENABLED` is kept `False` in the YAML files so normal FP32 checkpoints can be loaded safely. `quantize_fineturn.py` turns it on only after the FP32 checkpoint has been loaded and the QAT modules have been patched.
+
 ### Evaluation
 
 For example, if you want to test ViT-based CLIP-ReID for MSMT17
 
 ```
 CUDA_VISIBLE_DEVICES=0 python test_clipreid.py --config_file configs/person/vit_clipreid.yml TEST.WEIGHT 'your_trained_checkpoints_path/ViT-B-16_60.pth'
+```
+
+For a QAT checkpoint produced by `quantize_fineturn.py`, run evaluation with the same config and the saved QAT weight:
+
+```
+CUDA_VISIBLE_DEVICES=0 python test_clipreid.py --config_file configs/person/vit_clipreid.yml TEST.WEIGHT 'your_qat_checkpoint_path/ViT-B-16_5.pth' MODEL.QAT.ENABLED True
+```
+
+You can also run the inference script with speed logging:
+
+```
+CUDA_VISIBLE_DEVICES=0 python infer_clipreid.py --config_file configs/person/vit_clipreid.yml --weight 'your_checkpoint_path/ViT-B-16_60.pth'
+```
+
+For QAT inference with speed logging:
+
+```
+CUDA_VISIBLE_DEVICES=0 python infer_clipreid.py --config_file configs/person/vit_clipreid.yml --weight 'your_qat_checkpoint_path/ViT-B-16_5.pth' MODEL.QAT.ENABLED True
 ```
 
 ### Acknowledgement

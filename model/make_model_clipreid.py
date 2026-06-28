@@ -4,7 +4,13 @@ import numpy as np
 from .clip.simple_tokenizer import SimpleTokenizer as _Tokenizer
 _tokenizer = _Tokenizer()
 from timm.models.layers import DropPath, to_2tuple, trunc_normal_
-from .clip.apply_qat_clip import apply_qat_to_clip
+from .clip.apply_qat_clip import (
+    apply_qat_to_clip,
+    apply_qat_to_modified_resnet,
+    apply_qat_to_vision_transformer,
+    patch_residual_attention_block,
+)
+from .clip.model import ModifiedResNet, VisionTransformer
 
 def weights_init_kaiming(m):
     classname = m.__class__.__name__
@@ -176,6 +182,36 @@ class build_transformer(nn.Module):
 
 def make_model(cfg, num_class, camera_num, view_num):
     model = build_transformer(num_class, camera_num, view_num, cfg)
+    return model
+
+
+def apply_qat_to_clipreid_model(model, quantize_attention_internals=False):
+    """
+    Patch QAT vao wrapper CLIP-ReID SAU KHI da load checkpoint FP32.
+
+    Dung cho luong finetune tu checkpoint ReID da train xong:
+      1. build model voi MODEL.QAT.ENABLED = False
+      2. load checkpoint FP32
+      3. goi helper nay de thay Conv/Linear CLIP bang module QAT
+
+    Cach nay tranh lech key state_dict giua checkpoint FP32 va module QAT.
+    """
+    if isinstance(model.image_encoder, ModifiedResNet):
+        apply_qat_to_modified_resnet(model.image_encoder)
+    elif isinstance(model.image_encoder, VisionTransformer):
+        apply_qat_to_vision_transformer(
+            model.image_encoder,
+            quantize_attention_internals=quantize_attention_internals,
+        )
+    else:
+        raise TypeError(f"Khong nhan dien duoc image_encoder: {type(model.image_encoder)}")
+
+    for i, block in enumerate(model.text_encoder.transformer.resblocks):
+        model.text_encoder.transformer.resblocks[i] = patch_residual_attention_block(
+            block,
+            quantize_attention_internals=quantize_attention_internals,
+        )
+
     return model
 
 

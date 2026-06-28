@@ -9,7 +9,7 @@ from torch.cuda import amp
 import torch.distributed as dist
 from torch.nn import functional as F
 from loss.supcontrast import SupConLoss
-from model.clip.qat_layers import disable_qat_observers, enable_fake_quant
+from model.clip.qat_layers import disable_qat_observers, enable_fake_quant, enable_qat_observers
 
 def do_train_stage2(cfg,
              model,
@@ -47,6 +47,15 @@ def do_train_stage2(cfg,
     evaluator = R1_mAP_eval(num_query, max_rank=50, feat_norm=cfg.TEST.FEAT_NORM)
     scaler = amp.GradScaler()
     xent = SupConLoss(device)
+    if cfg.MODEL.QAT.ENABLED:
+        qat_model = model.module if isinstance(model, nn.DataParallel) else model
+        enable_qat_observers(qat_model)
+        enable_fake_quant(qat_model)
+        logger.info(
+            "QAT enabled: fake quant active; observer freeze epoch: {}".format(
+                cfg.MODEL.QAT.DISABLE_OBSERVER_EPOCH
+            )
+        )
     
     # train
     import time
