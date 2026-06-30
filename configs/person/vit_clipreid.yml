@@ -72,9 +72,9 @@ TEST:
   FEAT_NORM: 'yes'
 
 DATASETS:
-  NAMES: 'market1501'
-  ROOT_DIR: 'C:/Users/Lenovo/Documents'
-OUTPUT_DIR: 'output/market1501_vit_qat'
+  NAMES: 'msmt17'
+  ROOT_DIR: '/mnt/data/khanhtl/ReID'
+OUTPUT_DIR: 'output/it_qat'
 
 #   NAMES: ('dukemtmc')
 #   ROOT_DIR: ('')

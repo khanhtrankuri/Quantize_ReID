@@ -1,7 +1,4 @@
 
-import glob
-import re
-
 import os.path as osp
 
 from .bases import BaseImageDataset
@@ -35,11 +32,15 @@ class MSMT17(BaseImageDataset):
         self.list_gallery_path = osp.join(self.dataset_dir, 'list_gallery.txt')
 
         self._check_before_run()
-        train = self._process_dir(self.train_dir, self.list_train_path)
-        val = self._process_dir(self.train_dir, self.list_val_path)
+        train_records = self._read_list(self.list_train_path)
+        val_records = self._read_list(self.list_val_path)
+        train_pid2label = self._build_pid2label(train_records + val_records)
+
+        train = self._process_dir(self.train_dir, train_records, pid2label=train_pid2label)
+        val = self._process_dir(self.train_dir, val_records, pid2label=train_pid2label)
         train += val
-        query = self._process_dir(self.test_dir, self.list_query_path)
-        gallery = self._process_dir(self.test_dir, self.list_gallery_path)
+        query = self._process_dir(self.test_dir, self._read_list(self.list_query_path))
+        gallery = self._process_dir(self.test_dir, self._read_list(self.list_gallery_path))
         if verbose:
             print("=> MSMT17 loaded")
             self.print_dataset_statistics(train, query, gallery)
@@ -59,23 +60,40 @@ class MSMT17(BaseImageDataset):
             raise RuntimeError("'{}' is not available".format(self.train_dir))
         if not osp.exists(self.test_dir):
             raise RuntimeError("'{}' is not available".format(self.test_dir))
+        for list_path in [self.list_train_path, self.list_val_path, self.list_query_path, self.list_gallery_path]:
+            if not osp.exists(list_path):
+                raise RuntimeError("'{}' is not available".format(list_path))
 
-    def _process_dir(self, dir_path, list_path):
+    def _read_list(self, list_path):
+        records = []
         with open(list_path, 'r') as txt:
-            lines = txt.readlines()
+            for line in txt:
+                if not line.strip():
+                    continue
+                img_path, pid = line.split()
+                pid = int(pid)
+                if pid < 0:
+                    continue
+                records.append((img_path, pid))
+        return records
+
+    @staticmethod
+    def _build_pid2label(records):
+        pids = sorted({pid for _, pid in records})
+        return {pid: label for label, pid in enumerate(pids)}
+
+    def _process_dir(self, dir_path, records, pid2label=None):
         dataset = []
-        pid_container = set()
         cam_container = set()
-        for img_idx, img_info in enumerate(lines):
-            img_path, pid = img_info.split(' ')
-            pid = int(pid)  # no need to relabel
+
+        for img_path, pid in records:
+            label = pid2label[pid] if pid2label is not None else pid
+
             camid = int(img_path.split('_')[2])
             img_path = osp.join(dir_path, img_path)
-            dataset.append((img_path, self.pid_begin+pid, camid-1, 0))
-            pid_container.add(pid)
+
+            dataset.append((img_path, self.pid_begin + label, camid - 1, 0))
             cam_container.add(camid)
+
         print(cam_container, 'cam_container')
-        # check if pid starts from 0 and increments with 1
-        for idx, pid in enumerate(pid_container):
-            assert idx == pid, "See code comment for explanation"
         return dataset
