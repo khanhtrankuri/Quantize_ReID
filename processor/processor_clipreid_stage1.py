@@ -93,13 +93,14 @@ def do_train_stage1(cfg,
                                     loss_meter.avg, scheduler._get_lr(epoch)[0]))
 
         if epoch % checkpoint_period == 0:
+            checkpoint_name = '{}_fp32_stage1_{}.pth'.format(cfg.MODEL.NAME, epoch)
             if cfg.MODEL.DIST_TRAIN:
                 if dist.get_rank() == 0:
                     torch.save(model.state_dict(),
-                               os.path.join(cfg.OUTPUT_DIR, cfg.MODEL.NAME + '_stage1_{}.pth'.format(epoch)))
+                               os.path.join(cfg.OUTPUT_DIR, checkpoint_name))
             else:
                 torch.save(model.state_dict(),
-                           os.path.join(cfg.OUTPUT_DIR, cfg.MODEL.NAME + '_stage1_{}.pth'.format(epoch)))
+                           os.path.join(cfg.OUTPUT_DIR, checkpoint_name))
 
     all_end_time = time.monotonic()
     total_time = timedelta(seconds=all_end_time - all_start_time)

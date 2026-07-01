@@ -105,13 +105,14 @@ def do_train(cfg,
                     .format(epoch, time_per_batch, train_loader.batch_size / time_per_batch))
 
         if epoch % checkpoint_period == 0:
+            checkpoint_name = '{}_fp32_{}.pth'.format(cfg.MODEL.NAME, epoch)
             if cfg.MODEL.DIST_TRAIN:
                 if dist.get_rank() == 0:
                     torch.save(model.state_dict(),
-                               os.path.join(cfg.OUTPUT_DIR, cfg.MODEL.NAME + '_{}.pth'.format(epoch)))
+                               os.path.join(cfg.OUTPUT_DIR, checkpoint_name))
             else:
                 torch.save(model.state_dict(),
-                           os.path.join(cfg.OUTPUT_DIR, cfg.MODEL.NAME + '_{}.pth'.format(epoch)))
+                           os.path.join(cfg.OUTPUT_DIR, checkpoint_name))
 
         if epoch % eval_period == 0:
             if cfg.MODEL.DIST_TRAIN:

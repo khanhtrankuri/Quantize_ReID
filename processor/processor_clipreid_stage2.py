@@ -143,13 +143,15 @@ def do_train_stage2(cfg,
                     .format(epoch, time_per_batch, train_loader_stage2.batch_size / time_per_batch))
 
         if epoch % checkpoint_period == 0:
+            precision_tag = 'qat' if cfg.MODEL.QAT.ENABLED else 'fp32'
+            checkpoint_name = '{}_{}_{}.pth'.format(cfg.MODEL.NAME, precision_tag, epoch)
             if cfg.MODEL.DIST_TRAIN:
                 if dist.get_rank() == 0:
                     torch.save(model.state_dict(),
-                               os.path.join(cfg.OUTPUT_DIR, cfg.MODEL.NAME + '_{}.pth'.format(epoch)))
+                               os.path.join(cfg.OUTPUT_DIR, checkpoint_name))
             else:
                 torch.save(model.state_dict(),
-                           os.path.join(cfg.OUTPUT_DIR, cfg.MODEL.NAME + '_{}.pth'.format(epoch)))
+                           os.path.join(cfg.OUTPUT_DIR, checkpoint_name))
 
         if epoch % eval_period == 0:
             if cfg.MODEL.DIST_TRAIN:

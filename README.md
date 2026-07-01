@@ -82,13 +82,13 @@ CUDA_VISIBLE_DEVICES=0 python train_clipreid.py --config_file configs/person/vit
 After training, checkpoints are saved under `OUTPUT_DIR`. For CLIP-ReID, the usual files are:
 
 ```
-ViT-B-16_stage1_120.pth
-ViT-B-16_60.pth
-RN50_stage1_60.pth
-RN50_120.pth
+ViT-B-16_fp32_stage1_120.pth
+ViT-B-16_fp32_60.pth
+RN50_fp32_stage1_60.pth
+RN50_fp32_120.pth
 ```
 
-The exact epoch number depends on `SOLVER.STAGE1.MAX_EPOCHS`, `SOLVER.STAGE2.MAX_EPOCHS`, and the checkpoint period in the config.
+The exact epoch number depends on `SOLVER.STAGE1.MAX_EPOCHS`, `SOLVER.STAGE2.MAX_EPOCHS`, and the checkpoint period in the config. FP32 checkpoints always contain `_fp32_` in the filename.
 
 ### Quantization-aware finetuning
 
@@ -107,7 +107,7 @@ Example for ViT CLIP-ReID on Market-1501:
 ```
 CUDA_VISIBLE_DEVICES=0 python quantize_fineturn.py \
   --config_file configs/person/vit_clipreid.yml \
-  --weight output/market1501_vit_qat/ViT-B-16_60.pth \
+  --weight output/market1501_vit_qat/ViT-B-16_fp32_60.pth \
   --qat_epochs 5 \
   --qat_lr 1e-6 \
   --calib_batches 50
@@ -119,7 +119,7 @@ Windows PowerShell:
 $env:CUDA_VISIBLE_DEVICES="0"
 python quantize_fineturn.py `
   --config_file configs/person/vit_clipreid.yml `
-  --weight output/market1501_vit_qat/ViT-B-16_60.pth `
+  --weight output/market1501_vit_qat/ViT-B-16_fp32_60.pth `
   --qat_epochs 5 `
   --qat_lr 1e-6 `
   --calib_batches 50
@@ -149,30 +149,77 @@ MODEL:
 
 `MODEL.QAT.ENABLED` is kept `False` in the YAML files so normal FP32 checkpoints can be loaded safely. `quantize_fineturn.py` turns it on only after the FP32 checkpoint has been loaded and the QAT modules have been patched.
 
+QAT checkpoints are saved with `_qat_` in the filename, for example:
+
+```
+ViT-B-16_qat_5.pth
+RN50_qat_5.pth
+```
+
+### Convert QAT checkpoint to INT8
+
+After QAT finetuning, convert the `_qat_*.pth` checkpoint to a CPU INT8 deploy model:
+
+```
+python convert_int8.py \
+  --config_file configs/person/vit_clipreid.yml \
+  --weight output/market1501_vit_qat/ViT-B-16_qat_5.pth \
+  --output output/market1501_vit_qat/ViT-B-16_int8.pt
+```
+
+Windows PowerShell:
+
+```
+python convert_int8.py `
+  --config_file configs/person/vit_clipreid.yml `
+  --weight output/market1501_vit_qat/ViT-B-16_qat_5.pth `
+  --output output/market1501_vit_qat/ViT-B-16_int8.pt
+```
+
+The converter does two steps:
+
+```
+QAT checkpoint -> bake learned fake-quant weights -> dynamic INT8 Linear modules
+```
+
+Notes:
+
+- The converted `.pt` model is for CPU inference.
+- Eligible `nn.Linear` layers are converted to dynamic INT8.
+- QAT `Conv2d` weights are baked from fake-quant values but remain FP32 compute in this first deploy path.
+- LayerNorm, embeddings, projection parameters, softmax, and sensitive attention pieces stay FP32.
+- If the QAT checkpoint was trained with `--quantize_attention_internals`, pass the same option to `convert_int8.py`.
+
 ### Evaluation
 
 For example, if you want to test ViT-based CLIP-ReID for MSMT17
 
 ```
-CUDA_VISIBLE_DEVICES=0 python test_clipreid.py --config_file configs/person/vit_clipreid.yml TEST.WEIGHT 'your_trained_checkpoints_path/ViT-B-16_60.pth'
+CUDA_VISIBLE_DEVICES=0 python test_clipreid.py --config_file configs/person/vit_clipreid.yml TEST.WEIGHT 'your_trained_checkpoints_path/ViT-B-16_fp32_60.pth'
 ```
 
 For a QAT checkpoint produced by `quantize_fineturn.py`, run evaluation with the same config and the saved QAT weight:
 
 ```
-CUDA_VISIBLE_DEVICES=0 python test_clipreid.py --config_file configs/person/vit_clipreid.yml TEST.WEIGHT 'your_qat_checkpoint_path/ViT-B-16_5.pth' MODEL.QAT.ENABLED True
+CUDA_VISIBLE_DEVICES=0 python test_clipreid.py --config_file configs/person/vit_clipreid.yml TEST.WEIGHT 'your_qat_checkpoint_path/ViT-B-16_qat_5.pth' MODEL.QAT.ENABLED True
 ```
 
 You can also run the inference script with speed logging:
 
 ```
-CUDA_VISIBLE_DEVICES=0 python infer_clipreid.py --config_file configs/person/vit_clipreid.yml --weight 'your_checkpoint_path/ViT-B-16_60.pth'
+CUDA_VISIBLE_DEVICES=0 python infer_clipreid.py --config_file configs/person/vit_clipreid.yml --weight 'your_checkpoint_path/ViT-B-16_fp32_60.pth'
 ```
 
 For QAT inference with speed logging:
 
 ```
-CUDA_VISIBLE_DEVICES=0 python infer_clipreid.py --config_file configs/person/vit_clipreid.yml --weight 'your_qat_checkpoint_path/ViT-B-16_5.pth' MODEL.QAT.ENABLED True
+CUDA_VISIBLE_DEVICES=0 python infer_clipreid.py --config_file configs/person/vit_clipreid.yml --weight 'your_qat_checkpoint_path/ViT-B-16_qat_5.pth' MODEL.QAT.ENABLED True
+```
+
+For converted INT8 CPU inference:
+
+```
+python infer_clipreid.py --config_file configs/person/vit_clipreid.yml --int8_model 'your_int8_model_path/ViT-B-16_int8.pt'
 ```
 
 ### Acknowledgement

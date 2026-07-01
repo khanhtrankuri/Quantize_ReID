@@ -97,7 +97,7 @@ class build_transformer(nn.Module):
                 clip_model,
                 quantize_attention_internals=cfg.MODEL.QAT.QUANTIZE_ATTENTION_INTERNALS,
             )
-        clip_model.to("cuda")
+        clip_model.to(cfg.MODEL.DEVICE)
 
         self.image_encoder = clip_model.visual
 
@@ -115,7 +115,13 @@ class build_transformer(nn.Module):
             print('camera number is : {}'.format(view_num))
 
         dataset_name = cfg.DATASETS.NAMES
-        self.prompt_learner = PromptLearner(num_classes, dataset_name, clip_model.dtype, clip_model.token_embedding)
+        self.prompt_learner = PromptLearner(
+            num_classes,
+            dataset_name,
+            clip_model.dtype,
+            clip_model.token_embedding,
+            device=cfg.MODEL.DEVICE,
+        )
         self.text_encoder = TextEncoder(clip_model)
 
     def forward(self, x = None, label=None, get_image = False, get_text = False, cam_label= None, view_label=None):
@@ -233,7 +239,7 @@ def load_clip_to_cpu(backbone_name, h_resolution, w_resolution, vision_stride_si
     return model
 
 class PromptLearner(nn.Module):
-    def __init__(self, num_class, dataset_name, dtype, token_embedding):
+    def __init__(self, num_class, dataset_name, dtype, token_embedding, device="cuda"):
         super().__init__()
         if dataset_name == "VehicleID" or dataset_name == "veri":
             ctx_init = "A photo of a X X X X vehicle."
@@ -245,7 +251,7 @@ class PromptLearner(nn.Module):
         ctx_init = ctx_init.replace("_", " ")
         n_ctx = 4
         
-        tokenized_prompts = clip.tokenize(ctx_init).cuda() 
+        tokenized_prompts = clip.tokenize(ctx_init).to(device)
         with torch.no_grad():
             embedding = token_embedding(tokenized_prompts).type(dtype) 
         self.tokenized_prompts = tokenized_prompts  # torch.Tensor
