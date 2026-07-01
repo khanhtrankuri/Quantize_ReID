@@ -27,7 +27,7 @@ INPUT:
 DATALOADER:
   SAMPLER: 'softmax_triplet'
   NUM_INSTANCE: 4
-  NUM_WORKERS: 8
+  NUM_WORKERS: 4
 
 SOLVER:
   STAGE1:
@@ -72,7 +72,7 @@ TEST:
   FEAT_NORM: 'yes'
 
 DATASETS:
-  NAMES: 'msmt17'
+  NAMES: 'msmt17_datatt'
   ROOT_DIR: '/mnt/data/khanhtl/ReID'
 OUTPUT_DIR: 'output/it_qat'
 
