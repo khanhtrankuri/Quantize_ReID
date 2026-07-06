@@ -11,8 +11,8 @@ Chien luoc quantize ap dung:
   - Bottleneck (ResNet): quantize Conv1/2/3 + downsample conv (giu BN tach rieng,
     KHONG fuse luc training - chi fuse sau khi train QAT xong, truoc convert)
   - Stem 3 conv dau ModifiedResNet: quantize tuong tu Bottleneck
-  - AttentionPool2d: q/k/v_proj -> weight-only (vi dua truc tiep vao
-    F.multi_head_attention_forward), c_proj -> full QATLinear
+  - AttentionPool2d: q/k/v_proj/c_proj -> weight-only (vi forward doc truc tiep
+    .weight/.bias roi dua vao F.multi_head_attention_forward)
   - ResidualAttentionBlock.mlp (c_fc, c_proj): full QATLinear - uu tien cao nhat
   - ResidualAttentionBlock.attn: GIU NGUYEN nn.MultiheadAttention (mac dinh),
     chi thay bang QATMultiheadAttention neu quantize_attention_internals=True
@@ -57,16 +57,23 @@ def patch_bottleneck(bottleneck: Bottleneck) -> Bottleneck:
 
 def patch_attention_pool2d(pool: AttentionPool2d) -> AttentionPool2d:
     """
-    q_proj/k_proj/v_proj duoc dua truc tiep vao F.multi_head_attention_forward
-    (qua tham so q_proj_weight=, k_proj_weight=, v_proj_weight=), khong goi qua
-    forward() binh thuong cua Linear -> dung QATWeightOnly (chi fake-quantize
-    .weight khi truy cap, khong tu chay F.linear).
-    c_proj duoc dung binh thuong sau khi attention da xong -> full QATLinear.
+    q_proj/k_proj/v_proj/c_proj deu duoc AttentionPool2d.forward() doc truc tiep
+    qua .weight/.bias roi dua vao F.multi_head_attention_forward (q_proj_weight=,
+    k_proj_weight=, v_proj_weight=, out_proj_weight=, out_proj_bias=) - KHONG mot
+    module nao trong 4 module nay duoc goi qua forward() binh thuong cua Linear.
+
+    Vi vay CA 4 deu phai dung QATWeightOnly (chi fake-quantize .weight khi truy
+    cap, khong tu chay F.linear). Truoc day c_proj dung QATLinear voi ky vong
+    "full quant" (ca input lan weight), nhung vi forward() khong bao gio goi
+    c_proj(x) ma chi lay c_proj.weight/c_proj.bias, nen input_fake_quant cua
+    QATLinear la dead code (observer khong bao gio duoc cap nhat) va hanh vi
+    thuc te da la weight-only tu dau - doi sang QATWeightOnly de code phan anh
+    dung nhung gi thuc su dang xay ra.
     """
     pool.q_proj = QATWeightOnly.from_float(pool.q_proj)
     pool.k_proj = QATWeightOnly.from_float(pool.k_proj)
     pool.v_proj = QATWeightOnly.from_float(pool.v_proj)
-    pool.c_proj = QATLinear.from_float(pool.c_proj)
+    pool.c_proj = QATWeightOnly.from_float(pool.c_proj)
     return pool
 
 

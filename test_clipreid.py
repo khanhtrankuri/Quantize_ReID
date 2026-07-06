@@ -22,7 +22,7 @@ if __name__ == "__main__":
     cfg.merge_from_list(args.opts)
     cfg.freeze()
 
-    output_dir = cfg.OUTPUT_DIRvit_clipreid
+    output_dir = cfg.OUTPUT_DIR
     if output_dir and not os.path.exists(output_dir):
         os.makedirs(output_dir)
 
@@ -66,4 +66,3 @@ if __name__ == "__main__":
                  model,
                  val_loader,
                  num_query)
-
