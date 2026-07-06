@@ -11,6 +11,42 @@ from torch.nn import functional as F
 from loss.supcontrast import SupConLoss
 from model.clip.qat_layers import disable_qat_observers, enable_fake_quant, enable_qat_observers
 
+
+def _cfg_enabled(value):
+    if isinstance(value, str):
+        return value.lower() in ("1", "true", "yes", "on")
+    return bool(value)
+
+
+def _env_int(name, default):
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    try:
+        return max(1, int(value))
+    except ValueError:
+        return default
+
+
+def _rss_gib():
+    try:
+        with open("/proc/self/statm", "r") as statm:
+            resident_pages = int(statm.readline().split()[1])
+        return resident_pages * os.sysconf("SC_PAGE_SIZE") / (1024 ** 3)
+    except (OSError, IndexError, ValueError):
+        return None
+
+
+def _format_mem():
+    parts = []
+    rss = _rss_gib()
+    if rss is not None:
+        parts.append("rss={:.2f}GiB".format(rss))
+    if torch.cuda.is_available():
+        parts.append("cuda_alloc={:.2f}GiB".format(torch.cuda.memory_allocated() / (1024 ** 3)))
+        parts.append("cuda_reserved={:.2f}GiB".format(torch.cuda.memory_reserved() / (1024 ** 3)))
+    return ", ".join(parts) if parts else "memory=n/a"
+
 def do_train_stage2(cfg,
              model,
              center_criterion,
@@ -44,7 +80,12 @@ def do_train_stage2(cfg,
     loss_meter = AverageMeter()
     acc_meter = AverageMeter()
 
-    evaluator = R1_mAP_eval(num_query, max_rank=50, feat_norm=cfg.TEST.FEAT_NORM)
+    evaluator = R1_mAP_eval(
+        num_query,
+        max_rank=50,
+        feat_norm=cfg.TEST.FEAT_NORM,
+        num_samples=len(val_loader.dataset),
+    )
     scaler = amp.GradScaler()
     xent = SupConLoss(device)
     if cfg.MODEL.QAT.ENABLED:
@@ -211,7 +252,37 @@ def do_inference(cfg,
     logger = logging.getLogger("transreid.test")
     logger.info("Enter inferencing")
 
-    evaluator = R1_mAP_eval(num_query, max_rank=50, feat_norm=cfg.TEST.FEAT_NORM)
+    num_total = len(val_loader.dataset)
+    num_gallery = num_total - num_query
+    max_full_eval_elements = _env_int("REID_EVAL_MAX_FULL_ELEMENTS", 100_000_000)
+    reranking = _cfg_enabled(cfg.TEST.RE_RANKING)
+    if reranking and (num_query + num_gallery) * (num_query + num_gallery) > max_full_eval_elements:
+        logger.warning(
+            "TEST.RE_RANKING=True needs a full {}x{} distance matrix; disabling re-ranking for this run to avoid RAM OOM.".format(
+                num_query + num_gallery, num_query + num_gallery
+            )
+        )
+        reranking = False
+
+    logger.info(
+        "Inference set: query={}, gallery={}, total={}, batches={}, batch_size={}, reranking={}, {}".format(
+            num_query,
+            num_gallery,
+            num_total,
+            len(val_loader),
+            val_loader.batch_size,
+            reranking,
+            _format_mem(),
+        )
+    )
+
+    evaluator = R1_mAP_eval(
+        num_query,
+        max_rank=50,
+        feat_norm=cfg.TEST.FEAT_NORM,
+        reranking=reranking,
+        num_samples=num_total,
+    )
 
     evaluator.reset()
 
@@ -219,11 +290,11 @@ def do_inference(cfg,
         if torch.cuda.device_count() > 1:
             print('Using {} GPUs for inference'.format(torch.cuda.device_count()))
             model = nn.DataParallel(model)
-        model.to(device)
+    model.to(device)
 
     model.eval()
-    img_path_list = []
 
+    log_period = max(1, _env_int("REID_INFER_LOG_PERIOD", 500))
     for n_iter, (img, pid, camid, camids, target_view, imgpath) in enumerate(val_loader):
         with torch.no_grad():
             img = img.to(device)
@@ -237,9 +308,18 @@ def do_inference(cfg,
                 target_view = None
             feat = model(img, cam_label=camids, view_label=target_view)
             evaluator.update((feat, pid, camid))
-            img_path_list.extend(imgpath)
+        if (n_iter + 1) == 1 or (n_iter + 1) % log_period == 0 or (n_iter + 1) == len(val_loader):
+            logger.info(
+                "Inference progress: batch {}/{}, images {}, {}".format(
+                    n_iter + 1,
+                    len(val_loader),
+                    min((n_iter + 1) * val_loader.batch_size, num_total),
+                    _format_mem(),
+                )
+            )
 
 
+    logger.info("Feature extraction complete; computing metrics, {}".format(_format_mem()))
     cmc, mAP, _, _, _, _, _ = evaluator.compute()
     logger.info("Validation Results ")
     logger.info("mAP: {:.1%}".format(mAP))

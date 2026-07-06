@@ -56,19 +56,33 @@ def save_rankings(features, num_query, paths, output_path, topk):
     query_features = features[:num_query]
     gallery_features = features[num_query:]
     gallery_paths = paths[num_query:]
+    topk = min(topk, gallery_features.size(0))
+    if topk <= 0:
+        raise ValueError("Gallery split is empty; cannot save top-k rankings.")
 
-    dist = torch.cdist(query_features, gallery_features, p=2).numpy()
-    indices = np.argsort(dist, axis=1)[:, :topk]
+    chunk_size = int(os.environ.get("REID_RANKING_QUERY_CHUNK_SIZE", "64"))
+    chunk_size = max(1, chunk_size)
 
     rankings = []
-    for query_idx, gallery_indices in enumerate(indices):
-        rankings.append(
-            {
-                "query": str(paths[query_idx]),
-                "gallery": [str(gallery_paths[i]) for i in gallery_indices],
-                "distance": [float(dist[query_idx, i]) for i in gallery_indices],
-            }
-        )
+    query_features = query_features.float()
+    gallery_features = gallery_features.float()
+    with torch.no_grad():
+        for start in range(0, query_features.size(0), chunk_size):
+            end = min(start + chunk_size, query_features.size(0))
+            dist = torch.cdist(query_features[start:end], gallery_features, p=2)
+            distances, indices = torch.topk(dist, k=topk, dim=1, largest=False, sorted=True)
+            distances = distances.cpu().numpy()
+            indices = indices.cpu().numpy()
+
+            for row_idx, gallery_indices in enumerate(indices):
+                query_idx = start + row_idx
+                rankings.append(
+                    {
+                        "query": str(paths[query_idx]),
+                        "gallery": [str(gallery_paths[i]) for i in gallery_indices],
+                        "distance": [float(distances[row_idx, i]) for i in range(len(gallery_indices))],
+                    }
+                )
 
     np.savez_compressed(
         output_path,
@@ -216,7 +230,12 @@ def do_inference_with_speed(cfg, model, val_loader, num_query, warmup_batches):
     logger = logging.getLogger("transreid.test")
     logger.info("Enter inferencing")
 
-    evaluator = R1_mAP_eval(num_query, max_rank=50, feat_norm=cfg.TEST.FEAT_NORM)
+    evaluator = R1_mAP_eval(
+        num_query,
+        max_rank=50,
+        feat_norm=cfg.TEST.FEAT_NORM,
+        num_samples=len(val_loader.dataset),
+    )
     evaluator.reset()
 
     if device:

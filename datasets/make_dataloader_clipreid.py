@@ -110,3 +110,27 @@ def make_dataloader(cfg):
         collate_fn=train_collate_fn
     )
     return train_loader_stage2, train_loader_stage1, val_loader, len(dataset.query), num_classes, cam_num, view_num
+
+
+def make_test_dataloader(cfg):
+    val_transforms = T.Compose([
+        T.Resize(cfg.INPUT.SIZE_TEST),
+        T.ToTensor(),
+        T.Normalize(mean=cfg.INPUT.PIXEL_MEAN, std=cfg.INPUT.PIXEL_STD)
+    ])
+
+    dataset = __factory[cfg.DATASETS.NAMES](root=cfg.DATASETS.ROOT_DIR)
+    val_set = ImageDataset(dataset.query + dataset.gallery, val_transforms)
+
+    val_loader = DataLoader(
+        val_set, batch_size=cfg.TEST.IMS_PER_BATCH, shuffle=False, num_workers=cfg.DATALOADER.NUM_WORKERS,
+        collate_fn=val_collate_fn
+    )
+
+    return (
+        val_loader,
+        len(dataset.query),
+        dataset.num_train_pids,
+        dataset.num_train_cams,
+        dataset.num_train_vids,
+    )

@@ -1,3 +1,5 @@
+from collections import OrderedDict
+
 import torch
 import torch.nn as nn
 import numpy as np
@@ -90,7 +92,13 @@ class build_transformer(nn.Module):
         self.h_resolution = int((cfg.INPUT.SIZE_TRAIN[0]-16)//cfg.MODEL.STRIDE_SIZE[0] + 1)
         self.w_resolution = int((cfg.INPUT.SIZE_TRAIN[1]-16)//cfg.MODEL.STRIDE_SIZE[1] + 1)
         self.vision_stride_size = cfg.MODEL.STRIDE_SIZE[0]
-        clip_model = load_clip_to_cpu(self.model_name, self.h_resolution, self.w_resolution, self.vision_stride_size)
+        clip_model = load_clip_to_cpu(
+            self.model_name,
+            self.h_resolution,
+            self.w_resolution,
+            self.vision_stride_size,
+            cfg.MODEL.PRETRAIN_PATH,
+        )
         if cfg.MODEL.QAT.ENABLED:
             print("QAT enabled: patching CLIP visual/text modules with fake quantization")
             clip_model = apply_qat_to_clip(
@@ -222,7 +230,57 @@ def apply_qat_to_clipreid_model(model, quantize_attention_internals=False):
 
 
 from .clip import clip
-def load_clip_to_cpu(backbone_name, h_resolution, w_resolution, vision_stride_size):
+
+def _extract_checkpoint_state_dict(checkpoint):
+    if isinstance(checkpoint, dict):
+        for state_key in ("state_dict", "model", "model_state_dict"):
+            if state_key in checkpoint and isinstance(checkpoint[state_key], dict):
+                return checkpoint[state_key]
+    return checkpoint
+
+
+def _convert_clipreid_state_dict(state_dict):
+    if any(key.startswith("visual.") for key in state_dict):
+        return state_dict
+
+    converted = OrderedDict()
+    for key, value in state_dict.items():
+        clean_key = key[len("module."):] if key.startswith("module.") else key
+        if clean_key.startswith("image_encoder."):
+            converted["visual." + clean_key[len("image_encoder."):]] = value
+        elif clean_key.startswith("text_encoder."):
+            converted[clean_key[len("text_encoder."):]] = value
+
+    if not converted:
+        return state_dict
+
+    if "token_embedding.weight" not in converted:
+        text_width = converted["positional_embedding"].shape[-1]
+        converted["token_embedding.weight"] = torch.empty(
+            49408,
+            text_width,
+            dtype=converted["positional_embedding"].dtype,
+        )
+        nn.init.normal_(converted["token_embedding.weight"], std=0.02)
+    if "logit_scale" not in converted:
+        converted["logit_scale"] = torch.ones([], dtype=converted["positional_embedding"].dtype) * np.log(1 / 0.07)
+
+    print("Converted CLIP-ReID checkpoint keys to CLIP backbone state_dict.")
+    return converted
+
+
+def load_clip_to_cpu(backbone_name, h_resolution, w_resolution, vision_stride_size, pretrained_path=""):
+    if pretrained_path:
+        print("Loading CLIP backbone from MODEL.PRETRAIN_PATH: {}".format(pretrained_path))
+        try:
+            model = torch.jit.load(pretrained_path, map_location="cpu").eval()
+            state_dict = model.state_dict()
+        except RuntimeError:
+            checkpoint = torch.load(pretrained_path, map_location="cpu")
+            state_dict = _extract_checkpoint_state_dict(checkpoint)
+            state_dict = _convert_clipreid_state_dict(state_dict)
+        return clip.build_model(state_dict, h_resolution, w_resolution, vision_stride_size)
+
     url = clip._MODELS[backbone_name]
     model_path = clip._download(url)
 
@@ -286,4 +344,3 @@ class PromptLearner(nn.Module):
         ) 
 
         return prompts 
-
