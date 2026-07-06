@@ -1,6 +1,8 @@
 
 import os.path as osp
 
+from tqdm import tqdm
+
 from .bases import BaseImageDataset
 
 
@@ -32,15 +34,23 @@ class MSMT17(BaseImageDataset):
         self.list_gallery_path = osp.join(self.dataset_dir, 'list_gallery.txt')
 
         self._check_before_run()
-        train_records = self._read_list(self.list_train_path)
-        val_records = self._read_list(self.list_val_path)
+        train_records = self._read_list(self.list_train_path, desc="Reading list_train.txt")
+        val_records = self._read_list(self.list_val_path, desc="Reading list_val.txt")
         train_pid2label = self._build_pid2label(train_records + val_records)
 
-        train = self._process_dir(self.train_dir, train_records, pid2label=train_pid2label)
-        val = self._process_dir(self.train_dir, val_records, pid2label=train_pid2label)
+        train = self._process_dir(self.train_dir, train_records, pid2label=train_pid2label, desc="Loading train")
+        val = self._process_dir(self.train_dir, val_records, pid2label=train_pid2label, desc="Loading val")
         train += val
-        query = self._process_dir(self.test_dir, self._read_list(self.list_query_path))
-        gallery = self._process_dir(self.test_dir, self._read_list(self.list_gallery_path))
+        query = self._process_dir(
+            self.test_dir,
+            self._read_list(self.list_query_path, desc="Reading list_query.txt"),
+            desc="Loading query",
+        )
+        gallery = self._process_dir(
+            self.test_dir,
+            self._read_list(self.list_gallery_path, desc="Reading list_gallery.txt"),
+            desc="Loading gallery",
+        )
         if verbose:
             print("=> MSMT17 loaded")
             self.print_dataset_statistics(train, query, gallery)
@@ -64,17 +74,18 @@ class MSMT17(BaseImageDataset):
             if not osp.exists(list_path):
                 raise RuntimeError("'{}' is not available".format(list_path))
 
-    def _read_list(self, list_path):
+    def _read_list(self, list_path, desc=None):
         records = []
         with open(list_path, 'r') as txt:
-            for line in txt:
-                if not line.strip():
-                    continue
-                img_path, pid = line.split()
-                pid = int(pid)
-                if pid < 0:
-                    continue
-                records.append((img_path, pid))
+            lines = txt.readlines()
+        for line in tqdm(lines, desc=desc or "Reading list", unit="line"):
+            if not line.strip():
+                continue
+            img_path, pid = line.split()
+            pid = int(pid)
+            if pid < 0:
+                continue
+            records.append((img_path, pid))
         return records
 
     @staticmethod
@@ -82,11 +93,11 @@ class MSMT17(BaseImageDataset):
         pids = sorted({pid for _, pid in records})
         return {pid: label for label, pid in enumerate(pids)}
 
-    def _process_dir(self, dir_path, records, pid2label=None):
+    def _process_dir(self, dir_path, records, pid2label=None, desc=None):
         dataset = []
         cam_container = set()
 
-        for img_path, pid in records:
+        for img_path, pid in tqdm(records, desc=desc or "Loading dataset", unit="img"):
             label = pid2label[pid] if pid2label is not None else pid
 
             camid = int(img_path.split('_')[2])

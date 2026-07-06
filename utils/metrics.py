@@ -183,6 +183,11 @@ class R1_mAP_eval():
             "REID_EVAL_MAX_FULL_ELEMENTS",
             max_full_eval_elements or _DEFAULT_MAX_FULL_EVAL_ELEMENTS,
         )
+        # REID_EVAL_HALF_FEATS=1 -> luu feature dang float16 thay vi float32,
+        # giam ~50% RAM khi test set rat lon (vi du gop nhieu dataset lai).
+        # Sai so do lam tron khi tinh khoang cach thuong khong dang ke voi
+        # feature da chuan hoa (feat_norm=True).
+        self.half_feats = _is_enabled(os.environ.get("REID_EVAL_HALF_FEATS", "0"))
 
     def reset(self):
         self.feats = None if self.num_samples is not None else []
@@ -193,6 +198,8 @@ class R1_mAP_eval():
     def update(self, output):  # called once for each batch
         feat, pid, camid = output
         feat = feat.detach().cpu()
+        if self.half_feats:
+            feat = feat.half()
         pid = np.asarray(pid)
         camid = np.asarray(camid)
 
@@ -238,6 +245,12 @@ class R1_mAP_eval():
         self.feats = feats
         if _is_enabled(self.feat_norm):
             print("The test feature is normalized")
+            # Chuyen ve float32 truoc khi normalize: mot so kernel CPU khong ho
+            # tro (hoac kem chinh xac) tren tensor float16 (khi REID_EVAL_HALF_FEATS=1
+            # duoc dung de giam RAM luc gom feature). Buffer float16 tich luy da
+            # giai quyet phan RAM lon nhat (sustained trong suot vong lap trich
+            # xuat feature); ban sao float32 o day chi ton tai tam thoi.
+            feats = feats.float()
             feats.div_(torch.norm(feats, p=2, dim=1, keepdim=True).clamp_min_(1e-12))
             self.feats = feats
         # query
