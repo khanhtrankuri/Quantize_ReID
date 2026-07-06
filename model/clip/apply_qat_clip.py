@@ -11,8 +11,13 @@ Chien luoc quantize ap dung:
   - Bottleneck (ResNet): quantize Conv1/2/3 + downsample conv (giu BN tach rieng,
     KHONG fuse luc training - chi fuse sau khi train QAT xong, truoc convert)
   - Stem 3 conv dau ModifiedResNet: quantize tuong tu Bottleneck
-  - AttentionPool2d: q/k/v_proj/c_proj -> weight-only (vi forward doc truc tiep
-    .weight/.bias roi dua vao F.multi_head_attention_forward)
+  - AttentionPool2d:
+      * quantize_attention_internals=False (mac dinh): q/k/v/c_proj -> weight-only
+        (vi forward doc truc tiep .weight/.bias roi dua vao
+        F.multi_head_attention_forward)
+      * quantize_attention_internals=True: THAY THE HOAN TOAN bang
+        QATAttentionPool2d (qat_attention_pool.py) - quantize ca activation
+        va Q@K^T / attn_weights@V matmul, khong chi weight
   - ResidualAttentionBlock.mlp (c_fc, c_proj): full QATLinear - uu tien cao nhat
   - ResidualAttentionBlock.attn: GIU NGUYEN nn.MultiheadAttention (mac dinh),
     chi thay bang QATMultiheadAttention neu quantize_attention_internals=True
@@ -55,21 +60,27 @@ def patch_bottleneck(bottleneck: Bottleneck) -> Bottleneck:
 # 2. AttentionPool2d
 # ---------------------------------------------------------------------------
 
-def patch_attention_pool2d(pool: AttentionPool2d) -> AttentionPool2d:
+def patch_attention_pool2d(pool: AttentionPool2d, quantize_attention_internals: bool = False):
     """
-    q_proj/k_proj/v_proj/c_proj deu duoc AttentionPool2d.forward() doc truc tiep
-    qua .weight/.bias roi dua vao F.multi_head_attention_forward (q_proj_weight=,
-    k_proj_weight=, v_proj_weight=, out_proj_weight=, out_proj_bias=) - KHONG mot
-    module nao trong 4 module nay duoc goi qua forward() binh thuong cua Linear.
+    Mac dinh (quantize_attention_internals=False): q_proj/k_proj/v_proj/c_proj
+    deu duoc AttentionPool2d.forward() doc truc tiep qua .weight/.bias roi dua
+    vao F.multi_head_attention_forward (q_proj_weight=, k_proj_weight=,
+    v_proj_weight=, out_proj_weight=, out_proj_bias=) - KHONG mot module nao
+    trong 4 module nay duoc goi qua forward() binh thuong cua Linear. Vi vay
+    CA 4 deu dung QATWeightOnly (chi fake-quantize .weight khi truy cap, khong
+    tu chay F.linear).
 
-    Vi vay CA 4 deu phai dung QATWeightOnly (chi fake-quantize .weight khi truy
-    cap, khong tu chay F.linear). Truoc day c_proj dung QATLinear voi ky vong
-    "full quant" (ca input lan weight), nhung vi forward() khong bao gio goi
-    c_proj(x) ma chi lay c_proj.weight/c_proj.bias, nen input_fake_quant cua
-    QATLinear la dead code (observer khong bao gio duoc cap nhat) va hanh vi
-    thuc te da la weight-only tu dau - doi sang QATWeightOnly de code phan anh
-    dung nhung gi thuc su dang xay ra.
+    Neu quantize_attention_internals=True: THAY THE HOAN TOAN AttentionPool2d
+    bang QATAttentionPool2d (qat_attention_pool.py), reimplement lai dung phep
+    toan cua forward() goc nhung chen duoc FakeQuantize vao ca activation lan
+    Q@K^T / attn_weights@V matmul - dung khi ban muon quantize "tu Conv2d den
+    attention" trọn ven cho backbone RN50. Rui ro accuracy cao hon, nen luon
+    danh gia lai (eval_before/sau finetune) khi bat co nay.
     """
+    if quantize_attention_internals:
+        from .qat_attention_pool import replace_attention_pool2d_with_qat
+        return replace_attention_pool2d_with_qat(pool)
+
     pool.q_proj = QATWeightOnly.from_float(pool.q_proj)
     pool.k_proj = QATWeightOnly.from_float(pool.k_proj)
     pool.v_proj = QATWeightOnly.from_float(pool.v_proj)
@@ -81,13 +92,15 @@ def patch_attention_pool2d(pool: AttentionPool2d) -> AttentionPool2d:
 # 3. ModifiedResNet (RN50 visual backbone)
 # ---------------------------------------------------------------------------
 
-def apply_qat_to_modified_resnet(visual: ModifiedResNet) -> ModifiedResNet:
+def apply_qat_to_modified_resnet(
+    visual: ModifiedResNet, quantize_attention_internals: bool = False
+) -> ModifiedResNet:
     """
     Patch INPLACE: visual van la instance ModifiedResNet (khong doi class),
-    chi cac Conv2d/Linear con ben trong duoc thay bang ban QAT. Vi
-    ModifiedResNet.forward() goi self.conv1(x) (khong quan tam conv1 la
-    nn.Conv2d hay QATConv2d nho tinh da hinh cua nn.Module), KHONG can sua
-    forward() cua ModifiedResNet/Bottleneck chut nao.
+    chi cac Conv2d/Linear con ben trong duoc thay bang ban QAT (rieng attnpool
+    co the doi han sang QATAttentionPool2d neu quantize_attention_internals=True,
+    van gan lai vao visual.attnpool nen ModifiedResNet.forward() khong can sua
+    gi - no chi goi self.attnpool(x4) nho tinh da hinh cua nn.Module).
     """
     # 3 stem convolutions - giu BN tach rieng, chi quantize Conv
     visual.conv1 = QATConv2d.from_float(visual.conv1)
@@ -99,7 +112,9 @@ def apply_qat_to_modified_resnet(visual: ModifiedResNet) -> ModifiedResNet:
         for i, bottleneck in enumerate(layer):
             layer[i] = patch_bottleneck(bottleneck)
 
-    visual.attnpool = patch_attention_pool2d(visual.attnpool)
+    visual.attnpool = patch_attention_pool2d(
+        visual.attnpool, quantize_attention_internals=quantize_attention_internals
+    )
 
     return visual
 
@@ -167,9 +182,12 @@ def apply_qat_to_clip(model: CLIP, quantize_attention_internals: bool = False) -
 
     Args:
         model: instance CLIP da load pretrained weight (output cua build_model()).
-        quantize_attention_internals: neu True, thay nn.MultiheadAttention bang
-            QATMultiheadAttention (quantize ca Q@K^T va attn@V matmul). Mac dinh
-            False - chi quantize Conv/Linear, an toan hon, du dung cho hau het truong hop.
+        quantize_attention_internals: neu True, quantize toan bo phan attention:
+            - ResidualAttentionBlock.attn (ca visual ViT resblocks lan text
+              transformer resblocks) -> QATMultiheadAttention
+            - ModifiedResNet.attnpool (RN50) -> QATAttentionPool2d
+            Mac dinh False - chi quantize Conv/Linear (+ weight-only cho
+            attnpool), an toan hon, du dung cho hau het truong hop.
 
     Returns:
         model da duoc patch INPLACE (cung instance, cac submodule con ben trong
@@ -183,7 +201,9 @@ def apply_qat_to_clip(model: CLIP, quantize_attention_internals: bool = False) -
     """
     # --- Visual backbone ---
     if isinstance(model.visual, ModifiedResNet):
-        apply_qat_to_modified_resnet(model.visual)
+        apply_qat_to_modified_resnet(
+            model.visual, quantize_attention_internals=quantize_attention_internals
+        )
     elif isinstance(model.visual, VisionTransformer):
         apply_qat_to_vision_transformer(model.visual, quantize_attention_internals=quantize_attention_internals)
     else:

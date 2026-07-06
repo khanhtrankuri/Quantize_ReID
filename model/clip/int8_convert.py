@@ -4,7 +4,9 @@ import torch
 import torch.nn as nn
 from typing import Optional
 
+from .model import AttentionPool2d
 from .qat_attention import QATMultiheadAttention
+from .qat_attention_pool import QATAttentionPool2d
 from .qat_layers import QATConv2d, QATLinear, QATWeightOnly, disable_qat_observers, enable_fake_quant
 
 
@@ -147,6 +149,55 @@ def _mha_from_qat(module: QATMultiheadAttention) -> nn.MultiheadAttention:
     return attn
 
 
+@torch.no_grad()
+def _attnpool_from_qat(module: QATAttentionPool2d) -> AttentionPool2d:
+    """
+    Bake QATAttentionPool2d ve AttentionPool2d (model.py) voi weight da fake-
+    quantized, dung BakedWeightOnlyLinear cho ca 4 projection - GIONG cach
+    attnpool weight-only (QATWeightOnly) da tung duoc bake truoc day.
+
+    QUAN TRONG: KHONG duoc dung nn.Linear thuong o day. AttentionPool2d.forward()
+    (model.py) doc truc tiep .weight/.bias roi dua vao F.multi_head_attention_forward,
+    KHONG goi q_proj(x). Neu q_proj/k_proj/v_proj/c_proj la nn.Linear thuong, buoc
+    convert_linear_to_dynamic_int8() phia sau se quet trung va thay bang
+    nn.quantized.dynamic.Linear - class nay KHONG co attribute .weight/.bias
+    truc tiep (chi co method .weight()/.bias()) -> AttentionPool2d.forward() se
+    crash ngay khi chay. BakedWeightOnlyLinear tranh duoc loi nay vi no khong
+    subclass nn.Linear nen bi convert_linear_to_dynamic_int8() bo qua, dung
+    y het BakedWeightOnlyLinear dang dung cho duong QATWeightOnly mac dinh.
+
+    He qua: viec bat quantize_attention_internals=True chi cai thien do chinh
+    xac cua qua trinh MO PHONG quantize luc train QAT (activation + Q@K^T +
+    attn_weights@V duoc thay thuc trong forward), con o buoc deploy INT8 cuoi
+    cung, phan compute cua attnpool VAN la FP32 - giong het duong weight-only
+    mac dinh. Muon attnpool thuc su chay INT8 dynamic tren CPU se can viet lai
+    forward() de goi q_proj(x)/k_proj(x)/... nhu Linear binh thuong thay vi
+    doc .weight/.bias truc tiep - ngoai pham vi thay doi nay.
+    """
+    pool = AttentionPool2d(
+        spacial_dim=module.positional_embedding.shape[0] - 1,
+        embed_dim=module.embed_dim,
+        num_heads=module.num_heads,
+        output_dim=module.c_proj.out_features,
+    )
+    pool.positional_embedding.data.copy_(module.positional_embedding.detach())
+
+    pool.q_proj = BakedWeightOnlyLinear(
+        _fake_quant_weight(module.q_weight_fq, module.q_proj.weight), module.q_proj.bias
+    )
+    pool.k_proj = BakedWeightOnlyLinear(
+        _fake_quant_weight(module.k_weight_fq, module.k_proj.weight), module.k_proj.bias
+    )
+    pool.v_proj = BakedWeightOnlyLinear(
+        _fake_quant_weight(module.v_weight_fq, module.v_proj.weight), module.v_proj.bias
+    )
+    pool.c_proj = BakedWeightOnlyLinear(
+        _fake_quant_weight(module.out_weight_fq, module.c_proj.weight), module.c_proj.bias
+    )
+
+    return pool
+
+
 def bake_qat_fake_quant_weights(module: nn.Module) -> nn.Module:
     """
     Replace custom QAT wrappers with normal PyTorch modules whose weights have
@@ -156,6 +207,8 @@ def bake_qat_fake_quant_weights(module: nn.Module) -> nn.Module:
       - QATLinear/QATWeightOnly become nn.Linear with baked quantized weights.
       - QATConv2d becomes nn.Conv2d with baked quantized weights.
       - QATMultiheadAttention becomes nn.MultiheadAttention with baked weights.
+      - QATAttentionPool2d becomes AttentionPool2d (q/k/v/c_proj as
+        BakedWeightOnlyLinear so it stays safe for the raw-weight-read forward()).
 
     Conv2d remains FP32 compute after baking. Linear layers can then be converted
     to dynamic INT8 for CPU inference with torch.quantization.quantize_dynamic().
@@ -172,6 +225,8 @@ def bake_qat_fake_quant_weights(module: nn.Module) -> nn.Module:
             setattr(module, name, _linear_from_weight_only(child))
         elif isinstance(child, QATMultiheadAttention):
             setattr(module, name, _mha_from_qat(child))
+        elif isinstance(child, QATAttentionPool2d):
+            setattr(module, name, _attnpool_from_qat(child))
         else:
             bake_qat_fake_quant_weights(child)
 
