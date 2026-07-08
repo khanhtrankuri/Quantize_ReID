@@ -131,7 +131,22 @@ def eval_func(distmat, q_pids, g_pids, q_camids, g_camids, max_rank=50):
     return _finish_market1501_eval(all_cmc, all_AP, num_valid_q, num_no_valid_q, num_q)
 
 
-def eval_func_chunked(qf, gf, q_pids, g_pids, q_camids, g_camids, max_rank=50, query_chunk_size=64):
+def _release_cpu_memory():
+    """Tra memory tam ve OS: gc.collect() don object Python, malloc_trim don
+    glibc arena da bi fragment sau nhieu vong lap addmm_/argsort. Neu khong co
+    ham nay, RSS co the leo thang dan trong vong lap dai du logic Python
+    hoan toan "sach" (khong object nao bi giu tham chieu ngoai y muon)."""
+    import gc
+    gc.collect()
+    try:
+        import ctypes
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except Exception:
+        pass
+
+
+def eval_func_chunked(qf, gf, q_pids, g_pids, q_camids, g_camids, max_rank=50, query_chunk_size=64,
+                       release_every=50):
     """Market1501 evaluation without materializing the full query x gallery matrix."""
     num_q = qf.shape[0]
     num_g = gf.shape[0]
@@ -146,6 +161,7 @@ def eval_func_chunked(qf, gf, q_pids, g_pids, q_camids, g_camids, max_rank=50, q
     gf = gf.float()
     gf_square = torch.pow(gf, 2).sum(dim=1, keepdim=True).t()
     num_chunks = (num_q + query_chunk_size - 1) // query_chunk_size
+    release_every = max(1, _env_int("REID_EVAL_RELEASE_EVERY", release_every))
 
     for chunk_idx, start in enumerate(range(0, num_q, query_chunk_size), 1):
         end = min(start + query_chunk_size, num_q)
@@ -158,10 +174,15 @@ def eval_func_chunked(qf, gf, q_pids, g_pids, q_camids, g_camids, max_rank=50, q
         all_AP.extend(chunk_AP)
         num_valid_q += chunk_valid_q
         num_no_valid_q += chunk_no_valid_q
+        del distmat, indices
+
+        if chunk_idx % release_every == 0:
+            _release_cpu_memory()
 
         if chunk_idx == 1 or chunk_idx == num_chunks or chunk_idx % 100 == 0:
             print("=> Eval chunk {}/{}: queries {}-{}".format(chunk_idx, num_chunks, start, end - 1))
 
+    _release_cpu_memory()
     return _finish_market1501_eval(all_cmc, all_AP, num_valid_q, num_no_valid_q, num_q)
 
 

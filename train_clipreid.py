@@ -176,35 +176,41 @@ if __name__ == '__main__':
 
     loss_func, center_criterion = make_loss(train_cfg, num_classes=num_classes)
 
-    optimizer_1stage = make_optimizer_1stage(train_cfg, model)
-    scheduler_1stage = create_scheduler(optimizer_1stage, num_epochs = train_cfg.SOLVER.STAGE1.MAX_EPOCHS, lr_min = train_cfg.SOLVER.STAGE1.LR_MIN, \
-                        warmup_lr_init = train_cfg.SOLVER.STAGE1.WARMUP_LR_INIT, warmup_t = train_cfg.SOLVER.STAGE1.WARMUP_EPOCHS, noise_range = None)
+    if train_cfg.SOLVER.STAGE1.MAX_EPOCHS > 0:
+        optimizer_1stage = make_optimizer_1stage(train_cfg, model)
+        scheduler_1stage = create_scheduler(optimizer_1stage, num_epochs = train_cfg.SOLVER.STAGE1.MAX_EPOCHS, lr_min = train_cfg.SOLVER.STAGE1.LR_MIN, \
+                            warmup_lr_init = train_cfg.SOLVER.STAGE1.WARMUP_LR_INIT, warmup_t = train_cfg.SOLVER.STAGE1.WARMUP_EPOCHS, noise_range = None)
 
-    do_train_stage1(
-        train_cfg,
-        model,
-        train_loader_stage1,
-        optimizer_1stage,
-        scheduler_1stage,
-        args.local_rank
-    )
+        do_train_stage1(
+            train_cfg,
+            model,
+            train_loader_stage1,
+            optimizer_1stage,
+            scheduler_1stage,
+            args.local_rank
+        )
+    else:
+        logger.info("Skipping FP32 stage1 because SOLVER.STAGE1.MAX_EPOCHS <= 0")
 
-    optimizer_2stage, optimizer_center_2stage = make_optimizer_2stage(train_cfg, model, center_criterion)
-    scheduler_2stage = WarmupMultiStepLR(optimizer_2stage, train_cfg.SOLVER.STAGE2.STEPS, train_cfg.SOLVER.STAGE2.GAMMA, train_cfg.SOLVER.STAGE2.WARMUP_FACTOR,
-                                  train_cfg.SOLVER.STAGE2.WARMUP_ITERS, train_cfg.SOLVER.STAGE2.WARMUP_METHOD)
+    if train_cfg.SOLVER.STAGE2.MAX_EPOCHS > 0:
+        optimizer_2stage, optimizer_center_2stage = make_optimizer_2stage(train_cfg, model, center_criterion)
+        scheduler_2stage = WarmupMultiStepLR(optimizer_2stage, train_cfg.SOLVER.STAGE2.STEPS, train_cfg.SOLVER.STAGE2.GAMMA, train_cfg.SOLVER.STAGE2.WARMUP_FACTOR,
+                                      train_cfg.SOLVER.STAGE2.WARMUP_ITERS, train_cfg.SOLVER.STAGE2.WARMUP_METHOD)
 
-    do_train_stage2(
-        train_cfg,
-        model,
-        center_criterion,
-        train_loader_stage2,
-        val_loader,
-        optimizer_2stage,
-        optimizer_center_2stage,
-        scheduler_2stage,
-        loss_func,
-        num_query, args.local_rank
-    )
+        do_train_stage2(
+            train_cfg,
+            model,
+            center_criterion,
+            train_loader_stage2,
+            val_loader,
+            optimizer_2stage,
+            optimizer_center_2stage,
+            scheduler_2stage,
+            loss_func,
+            num_query, args.local_rank
+        )
+    else:
+        logger.info("Skipping FP32 stage2 because SOLVER.STAGE2.MAX_EPOCHS <= 0")
 
     if run_qat_after_fp32:
         fp32_checkpoint = args.qat_weight
@@ -229,30 +235,33 @@ if __name__ == '__main__':
             quantize_attention_internals=qat_cfg.MODEL.QAT.QUANTIZE_ATTENTION_INTERNALS,
         )
 
-        loss_func_qat, center_criterion_qat = make_loss(qat_cfg, num_classes=num_classes)
-        optimizer_2stage_qat, optimizer_center_2stage_qat = make_optimizer_2stage(qat_cfg, model, center_criterion_qat)
-        scheduler_2stage_qat = WarmupMultiStepLR(
-            optimizer_2stage_qat,
-            qat_cfg.SOLVER.STAGE2.STEPS,
-            qat_cfg.SOLVER.STAGE2.GAMMA,
-            qat_cfg.SOLVER.STAGE2.WARMUP_FACTOR,
-            qat_cfg.SOLVER.STAGE2.WARMUP_ITERS,
-            qat_cfg.SOLVER.STAGE2.WARMUP_METHOD,
-        )
+        if qat_cfg.SOLVER.STAGE2.MAX_EPOCHS > 0:
+            loss_func_qat, center_criterion_qat = make_loss(qat_cfg, num_classes=num_classes)
+            optimizer_2stage_qat, optimizer_center_2stage_qat = make_optimizer_2stage(qat_cfg, model, center_criterion_qat)
+            scheduler_2stage_qat = WarmupMultiStepLR(
+                optimizer_2stage_qat,
+                qat_cfg.SOLVER.STAGE2.STEPS,
+                qat_cfg.SOLVER.STAGE2.GAMMA,
+                qat_cfg.SOLVER.STAGE2.WARMUP_FACTOR,
+                qat_cfg.SOLVER.STAGE2.WARMUP_ITERS,
+                qat_cfg.SOLVER.STAGE2.WARMUP_METHOD,
+            )
 
-        do_train_stage2(
-            qat_cfg,
-            model,
-            center_criterion_qat,
-            train_loader_stage2,
-            val_loader,
-            optimizer_2stage_qat,
-            optimizer_center_2stage_qat,
-            scheduler_2stage_qat,
-            loss_func_qat,
-            num_query,
-            args.local_rank,
-        )
+            do_train_stage2(
+                qat_cfg,
+                model,
+                center_criterion_qat,
+                train_loader_stage2,
+                val_loader,
+                optimizer_2stage_qat,
+                optimizer_center_2stage_qat,
+                scheduler_2stage_qat,
+                loss_func_qat,
+                num_query,
+                args.local_rank,
+            )
+        else:
+            logger.info("Skipping QAT stage2 because SOLVER.STAGE2.MAX_EPOCHS <= 0")
         save_model_checkpoint(
             model,
             qat_cfg.OUTPUT_DIR,

@@ -143,6 +143,43 @@ class QATConv2d(nn.Module):
     def bias(self):
         return self.conv.bias
 
+    # Pass-through cac attribute cua nn.Conv2d ben trong - can thiet de
+    # fuse_conv_bn()/fuse_bottleneck() (ben duoi trong file nay) hoat dong dung
+    # tren Bottleneck da duoc patch QAT. Neu thieu cac property nay,
+    # fuse_conv_bn(bottleneck.conv1, ...) se nem AttributeError vi QATConv2d
+    # (nn.Module) khong tu dong forward attribute tu self.conv ra ngoai.
+    @property
+    def in_channels(self) -> int:
+        return self.conv.in_channels
+
+    @property
+    def out_channels(self) -> int:
+        return self.conv.out_channels
+
+    @property
+    def kernel_size(self):
+        return self.conv.kernel_size
+
+    @property
+    def stride(self):
+        return self.conv.stride
+
+    @property
+    def padding(self):
+        return self.conv.padding
+
+    @property
+    def dilation(self):
+        return self.conv.dilation
+
+    @property
+    def groups(self) -> int:
+        return self.conv.groups
+
+    @property
+    def padding_mode(self) -> str:
+        return self.conv.padding_mode
+
     @classmethod
     def from_float(cls, mod: nn.Conv2d) -> "QATConv2d":
         module = cls(

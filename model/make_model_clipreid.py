@@ -182,10 +182,34 @@ class build_transformer(nn.Module):
 
 
     def load_param(self, trained_path):
-        param_dict = torch.load(trained_path)
-        for i in param_dict:
-            self.state_dict()[i.replace('module.', '')].copy_(param_dict[i])
+        param_dict = torch.load(trained_path, map_location="cpu")
+        param_dict = _extract_checkpoint_state_dict(param_dict)
+        model_state = self.state_dict()
+        loaded_keys = []
+        skipped_keys = []
+
+        for i, value in param_dict.items():
+            clean_key = i.replace('module.', '')
+            if torch.is_tensor(value) and clean_key in model_state and model_state[clean_key].shape == value.shape:
+                model_state[clean_key].copy_(value)
+                loaded_keys.append(clean_key)
+            else:
+                skipped_keys.append(clean_key)
+
+        if not loaded_keys:
+            raise RuntimeError(
+                "No tensors were loaded from {}. Check whether MODEL.QAT.ENABLED matches the checkpoint type "
+                "(FP32 checkpoint -> MODEL.QAT.ENABLED False, QAT checkpoint -> MODEL.QAT.ENABLED True). "
+                "First skipped keys: {}".format(trained_path, skipped_keys[:10])
+            )
+
         print('Loading pretrained model from {}'.format(trained_path))
+        if skipped_keys:
+            print(
+                "Loaded {} tensors; skipped {} unmatched tensors. First skipped keys: {}".format(
+                    len(loaded_keys), len(skipped_keys), skipped_keys[:10]
+                )
+            )
 
     def load_param_finetune(self, model_path):
         param_dict = torch.load(model_path)
@@ -211,7 +235,10 @@ def apply_qat_to_clipreid_model(model, quantize_attention_internals=False):
     Cach nay tranh lech key state_dict giua checkpoint FP32 va module QAT.
     """
     if isinstance(model.image_encoder, ModifiedResNet):
-        apply_qat_to_modified_resnet(model.image_encoder)
+        apply_qat_to_modified_resnet(
+            model.image_encoder,
+            quantize_attention_internals=quantize_attention_internals,
+        )
     elif isinstance(model.image_encoder, VisionTransformer):
         apply_qat_to_vision_transformer(
             model.image_encoder,
