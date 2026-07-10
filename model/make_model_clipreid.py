@@ -14,6 +14,36 @@ from .clip.apply_qat_clip import (
 )
 from .clip.model import ModifiedResNet, VisionTransformer
 
+
+def _can_resize_loaded_tensor(key, target, value):
+    if not torch.is_tensor(target) or not torch.is_tensor(value):
+        return False
+    if target.dtype != value.dtype:
+        return False
+    if target.dim() != value.dim():
+        return False
+    quant_state_tokens = (
+        "fake_quant",
+        "activation_post_process",
+        "_fq.",
+        "weight_fq.",
+        "input_fake_quant.",
+        "output_fake_quant.",
+    )
+    return any(token in key for token in quant_state_tokens)
+
+
+def _copy_loaded_tensor(key, target, value):
+    if target.shape == value.shape:
+        target.copy_(value)
+        return True
+    if _can_resize_loaded_tensor(key, target, value):
+        target.resize_(value.shape)
+        target.copy_(value)
+        return True
+    return False
+
+
 def weights_init_kaiming(m):
     classname = m.__class__.__name__
     if classname.find('Linear') != -1:
@@ -190,8 +220,7 @@ class build_transformer(nn.Module):
 
         for i, value in param_dict.items():
             clean_key = i.replace('module.', '')
-            if torch.is_tensor(value) and clean_key in model_state and model_state[clean_key].shape == value.shape:
-                model_state[clean_key].copy_(value)
+            if clean_key in model_state and _copy_loaded_tensor(clean_key, model_state[clean_key], value):
                 loaded_keys.append(clean_key)
             else:
                 skipped_keys.append(clean_key)

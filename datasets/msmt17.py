@@ -4,6 +4,7 @@ import os.path as osp
 from tqdm import tqdm
 
 from .bases import BaseImageDataset
+from .reid_audit import audit_reid_split
 
 
 class MSMT17(BaseImageDataset):
@@ -20,7 +21,7 @@ class MSMT17(BaseImageDataset):
     # images: 32621 (train) + 11659 (query) + 82161 (gallery)
     # cameras: 15
     """
-    dataset_dir = 'MSMT17'
+    dataset_dir = 'MSMT17_datatt'
 
     def __init__(self, root='', verbose=True, pid_begin=0, **kwargs):
         super(MSMT17, self).__init__()
@@ -36,24 +37,30 @@ class MSMT17(BaseImageDataset):
         self._check_before_run()
         train_records = self._read_list(self.list_train_path, desc="Reading list_train.txt")
         val_records = self._read_list(self.list_val_path, desc="Reading list_val.txt")
+        query_records = self._read_list(self.list_query_path, desc="Reading list_query.txt")
+        gallery_records = self._read_list(self.list_gallery_path, desc="Reading list_gallery.txt")
         train_pid2label = self._build_pid2label(train_records + val_records)
+        self.raw_train = self._records_for_audit(train_records + val_records)
+        self.raw_query = self._records_for_audit(query_records)
+        self.raw_gallery = self._records_for_audit(gallery_records)
 
         train = self._process_dir(self.train_dir, train_records, pid2label=train_pid2label, desc="Loading train")
         val = self._process_dir(self.train_dir, val_records, pid2label=train_pid2label, desc="Loading val")
         train += val
         query = self._process_dir(
             self.test_dir,
-            self._read_list(self.list_query_path, desc="Reading list_query.txt"),
+            query_records,
             desc="Loading query",
         )
         gallery = self._process_dir(
             self.test_dir,
-            self._read_list(self.list_gallery_path, desc="Reading list_gallery.txt"),
+            gallery_records,
             desc="Loading gallery",
         )
         if verbose:
             print("=> MSMT17 loaded")
             self.print_dataset_statistics(train, query, gallery)
+            audit_reid_split(self.raw_train, self.raw_query, self.raw_gallery)
 
         self.train = train
         self.query = query
@@ -92,6 +99,13 @@ class MSMT17(BaseImageDataset):
     def _build_pid2label(records):
         pids = sorted({pid for _, pid in records})
         return {pid: label for label, pid in enumerate(pids)}
+
+    def _records_for_audit(self, records):
+        dataset = []
+        for img_path, pid in records:
+            camid = int(img_path.split('_')[2]) - 1
+            dataset.append((img_path, pid, camid, 0))
+        return dataset
 
     def _process_dir(self, dir_path, records, pid2label=None, desc=None):
         dataset = []

@@ -1,6 +1,7 @@
 import logging
 import os
 import time
+from collections import Counter, defaultdict
 import torch
 import torch.nn as nn
 from utils.meter import AverageMeter
@@ -46,6 +47,55 @@ def _format_mem():
         parts.append("cuda_alloc={:.2f}GiB".format(torch.cuda.memory_allocated() / (1024 ** 3)))
         parts.append("cuda_reserved={:.2f}GiB".format(torch.cuda.memory_reserved() / (1024 ** 3)))
     return ", ".join(parts) if parts else "memory=n/a"
+
+
+def _log_eval_split_audit(logger, val_loader, num_query, invalid_preview=20):
+    dataset = getattr(val_loader.dataset, "dataset", None)
+    if dataset is None:
+        logger.warning("Could not audit eval split: val_loader.dataset has no raw dataset attribute")
+        return
+
+    query = dataset[:num_query]
+    gallery = dataset[num_query:]
+    q_pids = [int(item[1]) for item in query]
+    g_pids = [int(item[1]) for item in gallery]
+    q_camids = [int(item[2]) for item in query]
+    g_camids = [int(item[2]) for item in gallery]
+
+    gallery_cams_by_pid = defaultdict(set)
+    for pid, camid in zip(g_pids, g_camids):
+        gallery_cams_by_pid[pid].add(camid)
+
+    valid = 0
+    invalid = []
+    for idx, (pid, qcam) in enumerate(zip(q_pids, q_camids)):
+        gallery_cams = gallery_cams_by_pid.get(pid, set())
+        if any(gallery_camid != qcam for gallery_camid in gallery_cams):
+            valid += 1
+        else:
+            invalid.append((idx, pid, qcam, sorted(gallery_cams)))
+
+    logger.info("=" * 80)
+    logger.info("ReID eval split audit")
+    logger.info("num query: {}".format(len(q_pids)))
+    logger.info("num gallery: {}".format(len(g_pids)))
+    logger.info("query IDs: {}".format(len(set(q_pids))))
+    logger.info("gallery IDs: {}".format(len(set(g_pids))))
+    logger.info("common IDs: {}".format(len(set(q_pids) & set(g_pids))))
+    logger.info("valid cross-camera queries: {} / {}".format(valid, len(q_pids)))
+    logger.info("invalid queries: {} / {}".format(len(invalid), len(q_pids)))
+    logger.info("query camera distribution: {}".format(Counter(q_camids)))
+    logger.info("gallery camera distribution: {}".format(Counter(g_camids)))
+    logger.info("first {} invalid queries:".format(invalid_preview))
+    for idx, pid, qcam, gallery_cams in invalid[:invalid_preview]:
+        logger.info("idx={}, pid={}, qcam={}, gallery_cams={}".format(idx, pid, qcam, gallery_cams))
+    if q_pids and float(valid) / float(len(q_pids)) < 0.8:
+        logger.warning(
+            "WARNING: Only {}/{} queries have valid cross-camera gallery matches. Metrics may be unreliable.".format(
+                valid, len(q_pids)
+            )
+        )
+    logger.info("=" * 80)
 
 def do_train_stage2(cfg,
              model,
@@ -275,6 +325,7 @@ def do_inference(cfg,
             _format_mem(),
         )
     )
+    _log_eval_split_audit(logger, val_loader, num_query)
 
     evaluator = R1_mAP_eval(
         num_query,

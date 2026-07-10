@@ -1,6 +1,7 @@
 import torch
 import numpy as np
 import os
+from collections import Counter, defaultdict
 from utils.reranking import re_ranking
 
 _DEFAULT_EVAL_QUERY_CHUNK_SIZE = 64
@@ -108,6 +109,15 @@ def _finish_market1501_eval(all_cmc, all_AP, num_valid_q, num_no_valid_q, num_q)
                 int(num_valid_q), num_q, num_no_valid_q
             )
         )
+    if num_q > 0 and float(num_valid_q) / float(num_q) < 0.8:
+        print(
+            "WARNING: Only {}/{} queries have valid cross-camera gallery matches. Metrics may be unreliable.".format(
+                int(num_valid_q), num_q
+            )
+        )
+        print(
+            "WARNING: mAP/CMC below are computed only on valid cross-camera queries, not on the full query split."
+        )
 
     assert num_valid_q > 0, "Error: all query identities do not appear in gallery"
 
@@ -116,6 +126,50 @@ def _finish_market1501_eval(all_cmc, all_AP, num_valid_q, num_no_valid_q, num_q)
     mAP = np.mean(all_AP)
 
     return all_cmc, mAP
+
+
+def audit_market1501_split(q_pids, g_pids, q_camids, g_camids, invalid_preview=20):
+    q_pids = np.asarray(q_pids).astype(np.int64)
+    g_pids = np.asarray(g_pids).astype(np.int64)
+    q_camids = np.asarray(q_camids).astype(np.int64)
+    g_camids = np.asarray(g_camids).astype(np.int64)
+
+    gallery_cams_by_pid = defaultdict(set)
+    for pid, camid in zip(g_pids, g_camids):
+        gallery_cams_by_pid[int(pid)].add(int(camid))
+
+    valid = 0
+    invalid = []
+    for idx, (pid, qcam) in enumerate(zip(q_pids, q_camids)):
+        pid = int(pid)
+        qcam = int(qcam)
+        gallery_cams = gallery_cams_by_pid.get(pid, set())
+        if any(gallery_camid != qcam for gallery_camid in gallery_cams):
+            valid += 1
+        else:
+            invalid.append((idx, pid, qcam, sorted(gallery_cams)))
+
+    print("=" * 80)
+    print("Market1501 evaluation split audit")
+    print("num query: {}".format(len(q_pids)))
+    print("num gallery: {}".format(len(g_pids)))
+    print("query IDs: {}".format(len(set(q_pids.tolist()))))
+    print("gallery IDs: {}".format(len(set(g_pids.tolist()))))
+    print("common IDs: {}".format(len(set(q_pids.tolist()) & set(g_pids.tolist()))))
+    print("valid cross-camera queries: {} / {}".format(valid, len(q_pids)))
+    print("invalid queries: {} / {}".format(len(invalid), len(q_pids)))
+    print("query camera distribution: {}".format(Counter(q_camids.tolist())))
+    print("gallery camera distribution: {}".format(Counter(g_camids.tolist())))
+    print("first {} invalid queries:".format(invalid_preview))
+    for idx, pid, qcam, gallery_cams in invalid[:invalid_preview]:
+        print("idx={}, pid={}, qcam={}, gallery_cams={}".format(idx, pid, qcam, gallery_cams))
+    if len(q_pids) > 0 and float(valid) / float(len(q_pids)) < 0.8:
+        print(
+            "WARNING: Only {}/{} queries have valid cross-camera gallery matches. Metrics may be unreliable.".format(
+                valid, len(q_pids)
+            )
+        )
+    print("=" * 80)
 
 
 def eval_func(distmat, q_pids, g_pids, q_camids, g_camids, max_rank=50):
@@ -283,6 +337,7 @@ class R1_mAP_eval():
         g_pids = np.asarray(pids[self.num_query:])
 
         g_camids = np.asarray(camids[self.num_query:])
+        audit_market1501_split(q_pids, g_pids, q_camids, g_camids)
         num_pairs = qf.shape[0] * gf.shape[0]
         if self.reranking:
             total_samples = qf.shape[0] + gf.shape[0]
