@@ -7,6 +7,7 @@ from solver.lr_scheduler import WarmupMultiStepLR
 from loss.make_loss import make_loss
 from processor.processor_clipreid_stage1 import do_train_stage1
 from processor.processor_clipreid_stage2 import do_train_stage2
+import copy
 import random
 import torch
 import numpy as np
@@ -46,6 +47,10 @@ def load_checkpoint(model, weight_path, logger=None):
     for key, value in checkpoint.items():
         clean_key = _remove_module_prefix(key)
         if torch.is_tensor(value) and clean_key in model_state and model_state[clean_key].shape == value.shape:
+            model_state[clean_key].copy_(value)
+            loaded_keys.append(clean_key)
+        elif torch.is_tensor(value) and clean_key in model_state and "fake_quant" in clean_key and clean_key.endswith((".scale", ".zero_point", ".min_val", ".max_val")):
+            model_state[clean_key].resize_(value.shape)
             model_state[clean_key].copy_(value)
             loaded_keys.append(clean_key)
         else:
@@ -230,8 +235,21 @@ if __name__ == '__main__':
         logger.info("Running QAT phase with config:\n{}".format(qat_cfg))
         logger.info("Loading FP32 checkpoint before QAT patch: {}".format(fp32_checkpoint))
         load_checkpoint(model, fp32_checkpoint, logger)
+        teacher_model = None
+        if qat_cfg.MODEL.QAT.DISTILLATION.ENABLED:
+            # Copy before patching: teacher has no fake quant and receives no gradients.
+            try:
+                teacher_model = copy.deepcopy(model).to(qat_cfg.MODEL.DEVICE).eval()
+                for parameter in teacher_model.parameters():
+                    parameter.requires_grad_(False)
+                logger.info("Created frozen FP32 teacher for QAT distillation.")
+            except RuntimeError as exc:
+                logger.warning("Could not keep an online FP32 teacher (%s); continuing QAT without distillation.", exc)
+                teacher_model = None
+
         model = apply_qat_to_clipreid_model(
             model,
+            qat_options=qat_cfg.MODEL.QAT,
             quantize_attention_internals=qat_cfg.MODEL.QAT.QUANTIZE_ATTENTION_INTERNALS,
         )
 
@@ -259,6 +277,7 @@ if __name__ == '__main__':
                 loss_func_qat,
                 num_query,
                 args.local_rank,
+                teacher_model=teacher_model,
             )
         else:
             logger.info("Skipping QAT stage2 because SOLVER.STAGE2.MAX_EPOCHS <= 0")

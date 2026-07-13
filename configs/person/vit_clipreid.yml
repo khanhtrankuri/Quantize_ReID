@@ -9,9 +9,36 @@ MODEL:
   TRIPLET_LOSS_WEIGHT : 1.0
   I2T_LOSS_WEIGHT : 1.0
   QAT:
-    ENABLED: True
-    QUANTIZE_ATTENTION_INTERNALS: True
+    # Keep normal FP32 training/checkpoint loading unchanged.  The dedicated
+    # quantize_finetune.py launcher enables QAT only after loading FP32 weights.
+    ENABLED: False
+    VISUAL_ONLY: True
+    QUANTIZE_TEXT_ENCODER: False
+    QUANTIZE_PATCH_EMBED: False
+    QUANTIZE_MLP: True
+    QUANTIZE_QKV_PROJ: True
+    QUANTIZE_ATTN_OUT_PROJ: True
+    QUANTIZE_QK_MATMUL: False
+    QUANTIZE_ATTN_PROB: False
+    QUANTIZE_AV_MATMUL: False
+    EXCLUDE_FIRST_N_BLOCKS: 0
+    EXCLUDE_LAST_N_BLOCKS: 2
+    WEIGHT_BITS: 8
+    ACTIVATION_BITS: 8
+    ACTIVATION_OBSERVER: 'moving_average'
+    ACTIVATION_PERCENTILE: 99.99
+    CALIBRATION_BATCHES: 50
     DISABLE_OBSERVER_EPOCH: 2
+    SMOOTHING:
+      ENABLED: True
+      ALPHA: 0.5
+      AUTO_SEARCH: False
+    DISTILLATION:
+      ENABLED: True
+      FEATURE_WEIGHT: 1.0
+      RELATION_WEIGHT: 5.0
+      DISTANCE_WEIGHT: 0.0
+      USE_PRE_BN_FEATURE: True
   # SIE_CAMERA: True
   # SIE_COE : 1.0
 
@@ -72,8 +99,10 @@ TEST:
   FEAT_NORM: 'yes'
 
 DATASETS:
-  NAMES: 'msmt17'
-  ROOT_DIR: '/mnt/data/khanhtl/ReID'
+  # `market1501.py` appends Market-1501-v15.09.15 itself, so this must be the
+  # parent folder, not the dataset folder itself.
+  NAMES: 'market1501'
+  ROOT_DIR: 'C:/Users/Lenovo/Documents'
 OUTPUT_DIR: 'output/it_qat'
 
 #   NAMES: ('dukemtmc')

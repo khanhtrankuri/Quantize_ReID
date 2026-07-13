@@ -5,7 +5,7 @@ import torch.nn as nn
 from typing import Optional
 
 from .model import AttentionPool2d
-from .qat_attention import QATMultiheadAttention
+from .qat_attention import SelectiveQuantMultiheadAttention
 from .qat_attention_pool import QATAttentionPool2d
 from .qat_layers import QATConv2d, QATLinear, QATWeightOnly, disable_qat_observers, enable_fake_quant
 
@@ -128,25 +128,11 @@ def _linear_from_weight_only(module: QATWeightOnly) -> BakedWeightOnlyLinear:
 
 
 @torch.no_grad()
-def _mha_from_qat(module: QATMultiheadAttention) -> nn.MultiheadAttention:
-    attn = nn.MultiheadAttention(module.embed_dim, module.num_heads, bias=True, batch_first=False)
-    q_weight = _fake_quant_weight(module.q_weight_fq, module.q_proj.weight)
-    k_weight = _fake_quant_weight(module.k_weight_fq, module.k_proj.weight)
-    v_weight = _fake_quant_weight(module.v_weight_fq, module.v_proj.weight)
-    attn.in_proj_weight.copy_(torch.cat([q_weight, k_weight, v_weight], dim=0))
-    attn.in_proj_bias.copy_(
-        torch.cat(
-            [
-                module.q_proj.bias.detach(),
-                module.k_proj.bias.detach(),
-                module.v_proj.bias.detach(),
-            ],
-            dim=0,
-        )
-    )
-    attn.out_proj.weight.copy_(_fake_quant_weight(module.out_weight_fq, module.out_proj.weight))
-    attn.out_proj.bias.copy_(module.out_proj.bias.detach())
-    return attn
+def _attention_from_qat(module: SelectiveQuantMultiheadAttention) -> SelectiveQuantMultiheadAttention:
+    # Preserve explicit projection modules.  They are converted directly to
+    # quantized dynamic Linear below; baking to nn.MultiheadAttention would hide
+    # them from the CPU INT8 backend.
+    return module
 
 
 @torch.no_grad()
@@ -204,7 +190,7 @@ def bake_qat_fake_quant_weights(module: nn.Module) -> nn.Module:
     already been fake-quantized using the learned QAT observer scale/zero-point.
 
     After this step:
-      - QATLinear/QATWeightOnly become nn.Linear with baked quantized weights.
+      - QATLinear modules are deliberately retained until direct INT8 packing.
       - QATConv2d becomes nn.Conv2d with baked quantized weights.
       - QATMultiheadAttention becomes nn.MultiheadAttention with baked weights.
       - QATAttentionPool2d becomes AttentionPool2d (q/k/v/c_proj as
@@ -218,19 +204,42 @@ def bake_qat_fake_quant_weights(module: nn.Module) -> nn.Module:
 
     for name, child in list(module.named_children()):
         if isinstance(child, QATLinear):
-            setattr(module, name, _linear_from_qat(child))
+            # Do not fake-quant/dequantize before `_dynamic_linear_from_qat`.
+            # That sequence would introduce the double rounding this pipeline
+            # explicitly avoids.
+            continue
         elif isinstance(child, QATConv2d):
             setattr(module, name, _conv_from_qat(child))
         elif isinstance(child, QATWeightOnly):
             setattr(module, name, _linear_from_weight_only(child))
-        elif isinstance(child, QATMultiheadAttention):
-            setattr(module, name, _mha_from_qat(child))
+        elif isinstance(child, SelectiveQuantMultiheadAttention):
+            bake_qat_fake_quant_weights(child)
         elif isinstance(child, QATAttentionPool2d):
             setattr(module, name, _attnpool_from_qat(child))
         else:
             bake_qat_fake_quant_weights(child)
 
     return module
+
+
+@torch.no_grad()
+def _dynamic_linear_from_qat(module: QATLinear):
+    """Pack learned QAT weight qparams directly: no fake-quant/dequant/requant roundtrip."""
+    observer = module.weight_fake_quant.activation_post_process
+    scale, zero_point = observer.calculate_qparams()
+    if scale.numel() != module.out_features:
+        observer(module.linear.weight.detach())
+        scale, zero_point = observer.calculate_qparams()
+    weight = torch.quantize_per_channel(
+        module.linear.weight.detach().cpu(), scale.detach().cpu().to(torch.double),
+        zero_point.detach().cpu().to(torch.long), 0, torch.qint8,
+    )
+    try:
+        linear = torch.ao.nn.quantized.dynamic.Linear(module.in_features, module.out_features, module.bias is not None)
+    except AttributeError:
+        linear = torch.nn.quantized.dynamic.Linear(module.in_features, module.out_features, module.bias is not None)
+    linear.set_weight_bias(weight, None if module.bias is None else module.bias.detach().cpu())
+    return linear
 
 
 def convert_linear_to_dynamic_int8(
@@ -259,4 +268,16 @@ def convert_linear_to_dynamic_int8(
             )
             torch.backends.quantized.engine = fallback
     model.cpu().eval()
-    return torch.quantization.quantize_dynamic(model, {nn.Linear}, dtype=dtype)
+    converted = 0
+    def replace(parent):
+        nonlocal converted
+        for name, child in list(parent.named_children()):
+            if isinstance(child, QATLinear):
+                setattr(parent, name, _dynamic_linear_from_qat(child))
+                converted += 1
+            else:
+                replace(child)
+    replace(model)
+    if converted == 0:
+        raise RuntimeError("No QATLinear modules were converted; refusing to save a fake INT8 model")
+    return model

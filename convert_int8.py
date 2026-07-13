@@ -9,6 +9,8 @@ import torch.nn as nn
 from config import cfg
 from datasets.make_dataloader_clipreid import make_dataloader
 from model.clip.int8_convert import bake_qat_fake_quant_weights, convert_linear_to_dynamic_int8
+from model.clip.deploy import CLIPReIDImageDeploy
+from model.clip.qat_layers import QATLinear
 from model.make_model_clipreid import make_model
 from utils.logger import setup_logger
 
@@ -25,14 +27,21 @@ def set_seed(seed):
 
 def load_checkpoint(model, weight_path):
     checkpoint = torch.load(weight_path, map_location="cpu")
-    if isinstance(checkpoint, dict) and "state_dict" in checkpoint:
-        checkpoint = checkpoint["state_dict"]
+    if isinstance(checkpoint, dict):
+        for state_key in ("state_dict", "model", "model_state_dict"):
+            if state_key in checkpoint and isinstance(checkpoint[state_key], dict):
+                checkpoint = checkpoint[state_key]
+                break
 
     model_state = model.state_dict()
     loaded, skipped = 0, []
     for key, value in checkpoint.items():
         clean_key = key.replace("module.", "")
         if clean_key in model_state and model_state[clean_key].shape == value.shape:
+            model_state[clean_key].copy_(value)
+            loaded += 1
+        elif clean_key in model_state and "fake_quant" in clean_key and clean_key.endswith((".scale", ".zero_point", ".min_val", ".max_val")):
+            model_state[clean_key].resize_(value.shape)
             model_state[clean_key].copy_(value)
             loaded += 1
         else:
@@ -57,11 +66,14 @@ def count_modules(model):
         "linear_fp32": 0,
         "linear_int8_dynamic": 0,
         "conv_fp32": 0,
+        "qat_linear": 0,
     }
     dynamic_linear_types = tuple(dynamic_linear_types)
 
     for module in model.modules():
-        if dynamic_linear_types and isinstance(module, dynamic_linear_types):
+        if isinstance(module, QATLinear):
+            counts["qat_linear"] += 1
+        elif dynamic_linear_types and isinstance(module, dynamic_linear_types):
             counts["linear_int8_dynamic"] += 1
         elif isinstance(module, nn.Linear):
             counts["linear_fp32"] += 1
@@ -125,6 +137,7 @@ if __name__ == "__main__":
     load_checkpoint(model, args.weight)
 
     model.cpu().float().eval()
+    model = CLIPReIDImageDeploy.from_full_model(model)
     model = bake_qat_fake_quant_weights(model)
     baked_counts = count_modules(model)
     model_int8 = convert_linear_to_dynamic_int8(model, engine=args.engine)
@@ -143,5 +156,6 @@ if __name__ == "__main__":
     )
 
     print("Saved INT8 converted model to {}".format(output_path))
-    print("Before dynamic INT8: {}".format(baked_counts))
-    print("After dynamic INT8: {}".format(int8_counts))
+    print("Before conversion: {}".format(baked_counts))
+    print("After conversion: {}".format(int8_counts))
+    print("Excluded FP32 Linear modules: {}".format(int8_counts["linear_fp32"]))

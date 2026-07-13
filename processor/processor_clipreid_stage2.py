@@ -97,6 +97,53 @@ def _log_eval_split_audit(logger, val_loader, num_query, invalid_preview=20):
         )
     logger.info("=" * 80)
 
+
+@torch.no_grad()
+def _calibrate_qat(cfg, model, loader, device, logger):
+    batches = int(getattr(cfg.MODEL.QAT, "CALIBRATION_BATCHES", 0))
+    if not cfg.MODEL.QAT.ENABLED or batches <= 0:
+        return
+    qat_model = model.module if isinstance(model, nn.DataParallel) else model
+    was_training = qat_model.training
+    qat_model.eval()
+    enable_qat_observers(qat_model)
+    # Calibration observes true FP32 activations; fake quant starts in adaptation.
+    from model.clip.qat_layers import disable_fake_quant
+    disable_fake_quant(qat_model)
+    seen = 0
+    for image, _, camera, view in loader:
+        image = image.to(device)
+        camera = camera.to(device) if cfg.MODEL.SIE_CAMERA else None
+        view = view.to(device) if cfg.MODEL.SIE_VIEW else None
+        qat_model(x=image, cam_label=camera, view_label=view)
+        seen += 1
+        if seen >= batches:
+            break
+    enable_fake_quant(qat_model)
+    smoothing = cfg.MODEL.QAT.SMOOTHING
+    if bool(smoothing.ENABLED) and hasattr(qat_model, "image_encoder") and hasattr(qat_model.image_encoder, "transformer"):
+        from model.clip.smoothing import smooth_transformer_blocks
+        count = smooth_transformer_blocks(qat_model.image_encoder, alpha=float(smoothing.ALPHA))
+        logger.info("Folded SmoothQuant scales into %d transformer groups (alpha=%s).", count, smoothing.ALPHA)
+    if was_training:
+        qat_model.train()
+    logger.info("QAT calibration completed on %d batches; fake quant is now enabled.", seen)
+
+
+def _distillation_loss(student_feat, teacher_feat, cfg):
+    student = F.normalize(student_feat.float(), dim=1)
+    teacher = F.normalize(teacher_feat.detach().float(), dim=1)
+    feature = (1.0 - F.cosine_similarity(student, teacher, dim=1)).mean()
+    relation = F.mse_loss(student @ student.t(), teacher @ teacher.t())
+    if student.shape[0] > 1:
+        diagonal = torch.eye(student.shape[0], device=student.device, dtype=torch.bool)
+        distance = F.mse_loss((1.0 - student @ student.t())[~diagonal], (1.0 - teacher @ teacher.t())[~diagonal])
+    else:
+        distance = student.new_zeros(())
+    terms = cfg.MODEL.QAT.DISTILLATION
+    total = terms.FEATURE_WEIGHT * feature + terms.RELATION_WEIGHT * relation + terms.DISTANCE_WEIGHT * distance
+    return total, feature, relation, distance
+
 def do_train_stage2(cfg,
              model,
              center_criterion,
@@ -106,7 +153,7 @@ def do_train_stage2(cfg,
              optimizer_center,
              scheduler,
              loss_fn,
-             num_query, local_rank):
+             num_query, local_rank, teacher_model=None):
     log_period = cfg.SOLVER.STAGE2.LOG_PERIOD
     checkpoint_period = cfg.SOLVER.STAGE2.CHECKPOINT_PERIOD
     eval_period = cfg.SOLVER.STAGE2.EVAL_PERIOD
@@ -147,6 +194,7 @@ def do_train_stage2(cfg,
                 cfg.MODEL.QAT.DISABLE_OBSERVER_EPOCH
             )
         )
+        _calibrate_qat(cfg, model, train_loader_stage2, device, logger)
     
     # train
     import time
@@ -185,6 +233,10 @@ def do_train_stage2(cfg,
         scheduler.step()
 
         model.train()
+        if teacher_model is not None:
+            teacher_model.eval()
+        feature_distill_meter = AverageMeter()
+        relation_distill_meter = AverageMeter()
         for n_iter, (img, vid, target_cam, target_view) in enumerate(train_loader_stage2):
             optimizer.zero_grad()
             optimizer_center.zero_grad()
@@ -202,6 +254,16 @@ def do_train_stage2(cfg,
                 score, feat, image_features = model(x = img, label = target, cam_label=target_cam, view_label=target_view)
                 logits = image_features @ text_features.t()
                 loss = loss_fn(score, feat, target, target_cam, logits)
+                if teacher_model is not None:
+                    with torch.no_grad():
+                        teacher_feature = teacher_model(img, cam_label=target_cam, view_label=target_view)
+                    if cfg.MODEL.QAT.DISTILLATION.USE_PRE_BN_FEATURE:
+                        student_feature = torch.cat([feat[1], feat[2]], dim=1)
+                    else:
+                        student_feature = torch.cat([model.module.bottleneck(feat[1]) if isinstance(model, nn.DataParallel) else model.bottleneck(feat[1]),
+                                                     model.module.bottleneck_proj(feat[2]) if isinstance(model, nn.DataParallel) else model.bottleneck_proj(feat[2])], dim=1)
+                    distill, loss_feature, loss_relation, loss_distance = _distillation_loss(student_feature, teacher_feature, cfg)
+                    loss = loss + distill
 
             scaler.scale(loss).backward()
 
@@ -217,13 +279,16 @@ def do_train_stage2(cfg,
             acc = (logits.max(1)[1] == target).float().mean()
 
             loss_meter.update(loss.item(), img.shape[0])
+            if teacher_model is not None:
+                feature_distill_meter.update(loss_feature.item(), img.shape[0])
+                relation_distill_meter.update(loss_relation.item(), img.shape[0])
             acc_meter.update(acc, 1)
 
             torch.cuda.synchronize()
             if (n_iter + 1) % log_period == 0:
-                logger.info("Epoch[{}] Iteration[{}/{}] Loss: {:.3f}, Acc: {:.3f}, Base Lr: {:.2e}"
+                logger.info("Epoch[{}] Iteration[{}/{}] Loss: {:.3f}, Acc: {:.3f}, DistillFeature: {:.4f}, DistillRelation: {:.4f}, Base Lr: {:.2e}"
                             .format(epoch, (n_iter + 1), len(train_loader_stage2),
-                                    loss_meter.avg, acc_meter.avg, scheduler.get_lr()[0]))
+                                    loss_meter.avg, acc_meter.avg, feature_distill_meter.avg, relation_distill_meter.avg, scheduler.get_lr()[0]))
 
         end_time = time.time()
         time_per_batch = (end_time - start_time) / (n_iter + 1)

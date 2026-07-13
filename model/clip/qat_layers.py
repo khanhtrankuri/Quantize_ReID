@@ -10,6 +10,7 @@ build_model() (trong model.py) da load checkpoint pretrained thanh cong.
 
 from __future__ import annotations
 from collections import OrderedDict
+import math
 
 import torch
 import torch.nn as nn
@@ -18,13 +19,13 @@ try:
     from torch.ao.quantization import (
         FakeQuantize,
         MovingAverageMinMaxObserver,
-        MovingAveragePerChannelMinMaxObserver,
+        MovingAveragePerChannelMinMaxObserver, HistogramObserver,
     )
 except ImportError:
     from torch.quantization import (
         FakeQuantize,
         MovingAverageMinMaxObserver,
-        MovingAveragePerChannelMinMaxObserver,
+        MovingAveragePerChannelMinMaxObserver, HistogramObserver,
     )
 
 
@@ -32,37 +33,78 @@ except ImportError:
 # Factory functions cho FakeQuantize
 # ---------------------------------------------------------------------------
 
+class PercentileObserver(MovingAverageMinMaxObserver):
+    """Stable, lightweight percentile observer for signed transformer tensors.
+
+    It intentionally tracks a bounded sample of absolute values instead of
+    retaining every activation.  The scale is always clamped away from zero.
+    """
+    def __init__(self, percentile: float = 99.99, **kwargs):
+        super().__init__(**kwargs)
+        self.percentile = float(percentile)
+
+    def forward(self, x_orig):
+        x = x_orig.detach().float().reshape(-1)
+        if x.numel() == 0:
+            return x_orig
+        if x.numel() > 65536:
+            x = x[:: max(1, x.numel() // 65536)]
+        bound = torch.quantile(x.abs(), min(max(self.percentile / 100.0, 0.0), 1.0))
+        bound = bound.clamp(min=torch.finfo(torch.float32).eps)
+        self.min_val.copy_((-bound).to(self.min_val.device))
+        self.max_val.copy_(bound.to(self.max_val.device))
+        return x_orig
+
+
 def make_activation_fake_quant(
-    dtype: torch.dtype = torch.quint8,
+    dtype: torch.dtype = torch.qint8,
     qscheme: torch.qscheme = torch.per_tensor_affine,
     averaging_constant: float = 0.01,
+    observer_name: str = "moving_average",
+    percentile: float = 99.99,
+    bits: int = 8,
 ) -> FakeQuantize:
     """
     FakeQuantize cho activation (per-tensor).
     dtype=quint8 (range [0,255])  -> activation sau ReLU (luon >= 0)
     dtype=qint8  (range [-128,127]) -> activation co the am (Q/K trong attention, truoc ReLU)
     """
+    if bits < 2 or bits > 8:
+        raise ValueError("Only 2-8 bit fake quantization is supported")
     if dtype == torch.quint8:
-        quant_min, quant_max = 0, 255
+        quant_min, quant_max = 0, (1 << bits) - 1
     else:
-        quant_min, quant_max = -128, 127
+        quant_min, quant_max = -(1 << (bits - 1)), (1 << (bits - 1)) - 1
+
+    observer_name = observer_name.lower()
+    if observer_name == "histogram":
+        observer = HistogramObserver
+        observer_kwargs = {}
+    elif observer_name == "percentile":
+        observer = PercentileObserver
+        observer_kwargs = {"percentile": percentile}
+    elif observer_name == "moving_average":
+        observer = MovingAverageMinMaxObserver
+        observer_kwargs = {"averaging_constant": averaging_constant}
+    else:
+        raise ValueError("Unknown activation observer: {}".format(observer_name))
 
     return FakeQuantize(
-        observer=MovingAverageMinMaxObserver,
+        observer=observer,
         quant_min=quant_min,
         quant_max=quant_max,
         dtype=dtype,
         qscheme=qscheme,
-        averaging_constant=averaging_constant,
+        **observer_kwargs,
     )
 
 
-def make_weight_fake_quant_per_channel(ch_axis: int = 0) -> FakeQuantize:
+def make_weight_fake_quant_per_channel(ch_axis: int = 0, bits: int = 8) -> FakeQuantize:
     """FakeQuantize cho weight, per-channel symmetric - chuan cho Conv2d/Linear."""
     return FakeQuantize(
         observer=MovingAveragePerChannelMinMaxObserver,
-        quant_min=-128,
-        quant_max=127,
+        quant_min=-(1 << (bits - 1)),
+        quant_max=(1 << (bits - 1)) - 1,
         dtype=torch.qint8,
         qscheme=torch.per_channel_symmetric,
         ch_axis=ch_axis,
@@ -74,21 +116,52 @@ def make_weight_fake_quant_per_channel(ch_axis: int = 0) -> FakeQuantize:
 # ---------------------------------------------------------------------------
 
 class QATLinear(nn.Module):
-    """Wrap nn.Linear: fake-quantize input activation (per-tensor) va weight (per-channel)."""
+    """W8A8 Linear with explicit, independently controllable fake quantizers."""
 
-    def __init__(self, in_features: int, out_features: int, bias: bool = True):
+    def __init__(self, in_features: int, out_features: int, bias: bool = True,
+                 weight_bits: int = 8, activation_bits: int = 8,
+                 activation_observer: str = "moving_average",
+                 activation_percentile: float = 99.99, name: str = ""):
         super().__init__()
         self.linear = nn.Linear(in_features, out_features, bias=bias)
-        self.weight_fake_quant = make_weight_fake_quant_per_channel(ch_axis=0)
-        self.input_fake_quant = make_activation_fake_quant(dtype=torch.qint8, qscheme=torch.per_tensor_symmetric)
+        self.module_name = name or "qat_linear"
+        self.weight_fake_quant = make_weight_fake_quant_per_channel(ch_axis=0, bits=weight_bits)
+        self.input_fake_quant = make_activation_fake_quant(
+            dtype=torch.qint8, qscheme=torch.per_tensor_symmetric,
+            observer_name=activation_observer, percentile=activation_percentile,
+            bits=activation_bits,
+        )
+        self.register_buffer("input_channel_absmax", torch.zeros(in_features))
+        self.register_buffer("smoothing_scale", torch.ones(in_features))
+        self.register_buffer("smoothing_applied", torch.tensor(False))
+
+    @torch.no_grad()
+    def _ensure_weight_qparams(self) -> None:
+        """Repair legacy checkpoints whose per-channel qparams remained [1]."""
+        fake_quant = self.weight_fake_quant
+        expected = self.linear.out_features
+        if fake_quant.scale.numel() == expected and fake_quant.zero_point.numel() == expected:
+            return
+        observer = fake_quant.activation_post_process
+        observer(self.linear.weight.detach())
+        scale, zero_point = observer.calculate_qparams()
+        fake_quant.scale.resize_(scale.shape)
+        fake_quant.scale.copy_(scale.to(fake_quant.scale.device, fake_quant.scale.dtype))
+        fake_quant.zero_point.resize_(zero_point.shape)
+        fake_quant.zero_point.copy_(zero_point.to(fake_quant.zero_point.device, fake_quant.zero_point.dtype))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        with torch.no_grad():
+            channel_max = x.detach().float().reshape(-1, x.shape[-1]).abs().amax(dim=0)
+            self.input_channel_absmax.copy_(torch.maximum(self.input_channel_absmax, channel_max.to(self.input_channel_absmax)))
         x = self.input_fake_quant(x)
+        self._ensure_weight_qparams()
         w = self.weight_fake_quant(self.linear.weight)
         return F.linear(x, w, self.linear.bias)
 
     @property
     def weight(self) -> torch.Tensor:
+        self._ensure_weight_qparams()
         return self.weight_fake_quant(self.linear.weight)
 
     @property
@@ -104,15 +177,16 @@ class QATLinear(nn.Module):
         return self.linear.out_features
 
     @classmethod
-    def from_float(cls, mod: nn.Linear) -> "QATLinear":
-        module = cls(mod.in_features, mod.out_features, bias=mod.bias is not None)
+    def from_float(cls, mod: nn.Linear, **kwargs) -> "QATLinear":
+        module = cls(mod.in_features, mod.out_features, bias=mod.bias is not None, **kwargs)
         module.linear.weight.data = mod.weight.data.clone()
         if mod.bias is not None:
             module.linear.bias.data = mod.bias.data.clone()
         return module
 
     def extra_repr(self) -> str:
-        return f"in_features={self.linear.in_features}, out_features={self.linear.out_features}, bias={self.linear.bias is not None}"
+        return "name={}, in_features={}, out_features={}, bias={}".format(
+            self.module_name, self.linear.in_features, self.linear.out_features, self.linear.bias is not None)
 
 
 # ---------------------------------------------------------------------------

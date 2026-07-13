@@ -130,9 +130,10 @@ class build_transformer(nn.Module):
             cfg.MODEL.PRETRAIN_PATH,
         )
         if cfg.MODEL.QAT.ENABLED:
-            print("QAT enabled: patching CLIP visual/text modules with fake quantization")
+            print("QAT enabled: patching selective visual modules with fake quantization")
             clip_model = apply_qat_to_clip(
                 clip_model,
+                options=cfg.MODEL.QAT,
                 quantize_attention_internals=cfg.MODEL.QAT.QUANTIZE_ATTENTION_INTERNALS,
             )
         clip_model.to(cfg.MODEL.DEVICE)
@@ -220,7 +221,9 @@ class build_transformer(nn.Module):
 
         for i, value in param_dict.items():
             clean_key = i.replace('module.', '')
-            if clean_key in model_state and _copy_loaded_tensor(clean_key, model_state[clean_key], value):
+            if torch.is_tensor(value) and clean_key in model_state and _copy_loaded_tensor(
+                clean_key, model_state[clean_key], value
+            ):
                 loaded_keys.append(clean_key)
             else:
                 skipped_keys.append(clean_key)
@@ -252,7 +255,7 @@ def make_model(cfg, num_class, camera_num, view_num):
     return model
 
 
-def apply_qat_to_clipreid_model(model, quantize_attention_internals=False):
+def apply_qat_to_clipreid_model(model, qat_options=None, quantize_attention_internals=False):
     """
     Patch QAT vao wrapper CLIP-ReID SAU KHI da load checkpoint FP32.
 
@@ -269,18 +272,19 @@ def apply_qat_to_clipreid_model(model, quantize_attention_internals=False):
             quantize_attention_internals=quantize_attention_internals,
         )
     elif isinstance(model.image_encoder, VisionTransformer):
-        apply_qat_to_vision_transformer(
-            model.image_encoder,
-            quantize_attention_internals=quantize_attention_internals,
-        )
+        apply_qat_to_vision_transformer(model.image_encoder, options=qat_options,
+                                        quantize_attention_internals=quantize_attention_internals)
     else:
         raise TypeError(f"Khong nhan dien duoc image_encoder: {type(model.image_encoder)}")
 
-    for i, block in enumerate(model.text_encoder.transformer.resblocks):
-        model.text_encoder.transformer.resblocks[i] = patch_residual_attention_block(
-            block,
-            quantize_attention_internals=quantize_attention_internals,
-        )
+    # The wrapper owns the same CLIP text transformer used by the prompt learner.
+    # It stays FP32 by default; only a deliberate non-visual-only experiment may
+    # patch it.
+    if qat_options is not None and not qat_options.VISUAL_ONLY and qat_options.QUANTIZE_TEXT_ENCODER:
+        total_blocks = len(model.text_encoder.transformer.resblocks)
+        for i, block in enumerate(model.text_encoder.transformer.resblocks):
+            model.text_encoder.transformer.resblocks[i] = patch_residual_attention_block(
+                block, options=qat_options, block_index=i, total_blocks=total_blocks)
 
     return model
 

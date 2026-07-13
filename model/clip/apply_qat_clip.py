@@ -28,6 +28,8 @@ Chien luoc quantize ap dung:
 
 from __future__ import annotations
 
+import fnmatch
+import json
 import torch.nn as nn
 
 from .model import Bottleneck, AttentionPool2d, ModifiedResNet, VisionTransformer, ResidualAttentionBlock, CLIP
@@ -123,9 +125,30 @@ def apply_qat_to_modified_resnet(
 # 4. ResidualAttentionBlock - dung chung cho Vision Transformer va Text Transformer
 # ---------------------------------------------------------------------------
 
-def patch_residual_attention_block(
-    block: ResidualAttentionBlock, quantize_attention_internals: bool = False
-) -> ResidualAttentionBlock:
+def _qat_kwargs(options):
+    return {
+        "weight_bits": int(getattr(options, "WEIGHT_BITS", 8)),
+        "activation_bits": int(getattr(options, "ACTIVATION_BITS", 8)),
+        "activation_observer": str(getattr(options, "ACTIVATION_OBSERVER", "moving_average")),
+        "activation_percentile": float(getattr(options, "ACTIVATION_PERCENTILE", 99.99)),
+    }
+
+
+def _excluded(name, options):
+    patterns = list(getattr(options, "FP32_MODULE_PATTERNS", ()))
+    sensitivity_path = getattr(options, "SENSITIVITY_JSON", "")
+    if sensitivity_path:
+        try:
+            with open(sensitivity_path, "r") as handle:
+                data = json.load(handle)
+            threshold = float(getattr(options, "MAX_MAP_DROP_PER_MODULE", 0.005))
+            patterns.extend(key for key, result in data.items() if result.get("delta_map", 0.0) < -threshold)
+        except (OSError, ValueError, TypeError):
+            pass
+    return any(fnmatch.fnmatch(name, pattern) or pattern in name for pattern in patterns)
+
+
+def patch_residual_attention_block(block: ResidualAttentionBlock, options=None, block_index=0, total_blocks=0) -> ResidualAttentionBlock:
     """
     - mlp.c_fc, mlp.c_proj -> QATLinear (uu tien cao nhat, chiem FLOPs lon nhat)
     - attn -> mac dinh GIU NGUYEN nn.MultiheadAttention (F.multi_head_attention_forward
@@ -135,13 +158,27 @@ def patch_residual_attention_block(
     - ln_1, ln_2 -> KHONG quantize (LayerNorm)
     - QuickGELU -> KHONG quantize (activation function)
     """
-    block.mlp.c_fc = QATLinear.from_float(block.mlp.c_fc)
-    block.mlp.c_proj = QATLinear.from_float(block.mlp.c_proj)
+    options = options or _LegacyQATOptions()
+    excluded = (
+        block_index < int(getattr(options, "EXCLUDE_FIRST_N_BLOCKS", 0))
+        or block_index >= total_blocks - int(getattr(options, "EXCLUDE_LAST_N_BLOCKS", 0))
+        or _excluded("image_encoder.transformer.resblocks.{}".format(block_index), options)
+    )
+    kwargs = _qat_kwargs(options)
+    if not excluded and bool(getattr(options, "QUANTIZE_MLP", True)):
+        block.mlp.c_fc = QATLinear.from_float(block.mlp.c_fc, name="block_{}.mlp.c_fc".format(block_index), **kwargs)
+        block.mlp.c_proj = QATLinear.from_float(block.mlp.c_proj, name="block_{}.mlp.c_proj".format(block_index), **kwargs)
 
-    if quantize_attention_internals:
+    if not excluded and (bool(getattr(options, "QUANTIZE_QKV_PROJ", True)) or bool(getattr(options, "QUANTIZE_ATTN_OUT_PROJ", True))):
         from .qat_attention import replace_multihead_attention_with_qat
-        block.attn = replace_multihead_attention_with_qat(block.attn)
-    # else: block.attn giu nguyen nn.MultiheadAttention, khong doi
+        block.attn = replace_multihead_attention_with_qat(
+            block.attn,
+            quantize_qkv=bool(getattr(options, "QUANTIZE_QKV_PROJ", True)),
+            quantize_out=bool(getattr(options, "QUANTIZE_ATTN_OUT_PROJ", True)),
+            quantize_qk_matmul=bool(getattr(options, "QUANTIZE_QK_MATMUL", False)),
+            quantize_av_matmul=bool(getattr(options, "QUANTIZE_AV_MATMUL", False)),
+            qat_kwargs=kwargs,
+        )
 
     return block
 
@@ -150,15 +187,16 @@ def patch_residual_attention_block(
 # 5. VisionTransformer
 # ---------------------------------------------------------------------------
 
-def apply_qat_to_vision_transformer(
-    visual: VisionTransformer, quantize_attention_internals: bool = False
-) -> VisionTransformer:
+def apply_qat_to_vision_transformer(visual: VisionTransformer, options=None, quantize_attention_internals=False) -> VisionTransformer:
     """Quantize patch-embedding conv1, va patch toan bo resblocks ben trong."""
-    visual.conv1 = QATConv2d.from_float(visual.conv1)
+    options = options or _LegacyQATOptions(quantize_attention_internals=quantize_attention_internals)
+    if bool(getattr(options, "QUANTIZE_PATCH_EMBED", False)):
+        visual.conv1 = QATConv2d.from_float(visual.conv1)
 
+    total_blocks = len(visual.transformer.resblocks)
     for i, block in enumerate(visual.transformer.resblocks):
         visual.transformer.resblocks[i] = patch_residual_attention_block(
-            block, quantize_attention_internals=quantize_attention_internals
+            block, options=options, block_index=i, total_blocks=total_blocks
         )
 
     # ln_pre, ln_post: KHONG quantize (LayerNorm)
@@ -170,7 +208,20 @@ def apply_qat_to_vision_transformer(
 # 6. Entry point chinh - ap dung cho toan bo CLIP model
 # ---------------------------------------------------------------------------
 
-def apply_qat_to_clip(model: CLIP, quantize_attention_internals: bool = False) -> CLIP:
+class _LegacyQATOptions:
+    """Safe options for callers that still use the old boolean API."""
+    def __init__(self, quantize_attention_internals=False):
+        self.WEIGHT_BITS = 8; self.ACTIVATION_BITS = 8
+        self.ACTIVATION_OBSERVER = "moving_average"; self.ACTIVATION_PERCENTILE = 99.99
+        self.QUANTIZE_PATCH_EMBED = False; self.QUANTIZE_MLP = True
+        self.QUANTIZE_QKV_PROJ = bool(quantize_attention_internals)
+        self.QUANTIZE_ATTN_OUT_PROJ = bool(quantize_attention_internals)
+        self.QUANTIZE_QK_MATMUL = False; self.QUANTIZE_AV_MATMUL = False
+        self.EXCLUDE_FIRST_N_BLOCKS = 0; self.EXCLUDE_LAST_N_BLOCKS = 0
+        self.FP32_MODULE_PATTERNS = (); self.SENSITIVITY_JSON = ""
+
+
+def apply_qat_to_clip(model: CLIP, options=None, quantize_attention_internals: bool = False) -> CLIP:
     """
     Ap dung QAT cho toan bo model CLIP - tu dong nhan dien visual backbone la
     ModifiedResNet (RN50) hay VisionTransformer (ViT) va xu ly tuong ung.
@@ -200,19 +251,21 @@ def apply_qat_to_clip(model: CLIP, quantize_attention_internals: bool = False) -
         - token_embedding (nn.Embedding)
     """
     # --- Visual backbone ---
+    options = options or _LegacyQATOptions(quantize_attention_internals)
     if isinstance(model.visual, ModifiedResNet):
         apply_qat_to_modified_resnet(
             model.visual, quantize_attention_internals=quantize_attention_internals
         )
     elif isinstance(model.visual, VisionTransformer):
-        apply_qat_to_vision_transformer(model.visual, quantize_attention_internals=quantize_attention_internals)
+        apply_qat_to_vision_transformer(model.visual, options=options)
     else:
         raise TypeError(f"Khong nhan dien duoc loai visual backbone: {type(model.visual)}")
 
-    # --- Text Transformer (luon ton tai, dung chung ResidualAttentionBlock) ---
-    for i, block in enumerate(model.transformer.resblocks):
-        model.transformer.resblocks[i] = patch_residual_attention_block(
-            block, quantize_attention_internals=quantize_attention_internals
-        )
+    # Text is not needed by image retrieval deployment.  Keep it FP32 unless an
+    # experiment explicitly opts in; this also protects cached teacher text features.
+    if not bool(getattr(options, "VISUAL_ONLY", True)) and bool(getattr(options, "QUANTIZE_TEXT_ENCODER", False)):
+        total_blocks = len(model.transformer.resblocks)
+        for i, block in enumerate(model.transformer.resblocks):
+            model.transformer.resblocks[i] = patch_residual_attention_block(block, options, i, total_blocks)
 
     return model
