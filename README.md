@@ -23,6 +23,78 @@ pip install regex
 
 Download the datasets ([Market-1501](https://drive.google.com/file/d/0B8-rUzbwVRk0c054eEozWG9COHM/view), [MSMT17](https://arxiv.org/abs/1711.08565), [DukeMTMC-reID](https://arxiv.org/abs/1609.01775), [Occluded-Duke](https://github.com/lightas/Occluded-DukeMTMC-Dataset), [VehicleID](https://www.pkuml.org/resources/pku-vehicleid.html), [VeRi-776](https://github.com/JDAI-CV/VeRidataset)), and then unzip them to `your_dataset_dir`.
 
+### Chạy toàn bộ pipeline trên Windows PowerShell (Market-1501)
+
+Luồng khuyến nghị là **FP32 -> QAT -> INT8 CPU -> benchmark**. Chạy từng bước theo thứ tự; thay tên checkpoint nếu `OUTPUT_DIR` hoặc số epoch của bạn khác ví dụ dưới đây.
+
+1. Kích hoạt môi trường và chuyển vào repository:
+
+```powershell
+conda activate quantize
+Set-Location C:\Users\Lenovo\Documents\Quantize\Quantize_ReID
+```
+
+2. Kiểm tra dữ liệu. Config mặc định `configs/person/vit_clipreid.yml` dùng `DATASETS.ROOT_DIR: C:/Users/Lenovo/Documents`, vì vậy Market-1501 phải ở:
+
+```text
+C:\Users\Lenovo\Documents\Market-1501-v15.09.15\
+```
+
+3. Train CLIP-ReID FP32. Đây là checkpoint đầu vào bắt buộc cho QAT; `CUDA_VISIBLE_DEVICES` chọn GPU sử dụng.
+
+```powershell
+# Train ViT-B-16 CLIP-ReID FP32 trên GPU 0.
+$env:CUDA_VISIBLE_DEVICES = "0"
+python train_clipreid.py `
+  --config_file configs/person/vit_clipreid.yml
+```
+
+Checkpoint FP32 được ghi vào `OUTPUT_DIR` (mặc định `output/it_qat`) với hậu tố `_fp32_`, ví dụ `ViT-B-16_fp32_40.pth`.
+
+4. Fine-tune QAT từ checkpoint FP32. Script tự tải checkpoint FP32, patch module QAT, calibrate observer, sau đó chỉ train pha QAT. Không bật `MODEL.QAT.ENABLED` khi train FP32 ở bước 3.
+
+```powershell
+# --weight: checkpoint FP32 từ bước 3.
+# --qat_epochs: số epoch QAT; --qat_lr: learning rate nhỏ để thích nghi QAT.
+# --calib_batches: số batch dùng để hiệu chỉnh scale/zero-point trước QAT.
+python quantize_finetune.py `
+  --config_file configs/person/vit_clipreid.yml `
+  --weight output/it_qat/ViT-B-16_fp32_40.pth `
+  --qat_epochs 5 `
+  --qat_lr 1e-6 `
+  --calib_batches 50
+```
+
+Kết quả là checkpoint QAT, ví dụ `output/it_qat/ViT-B-16_qat_5.pth`.
+
+5. Chuyển checkpoint QAT thành mô hình INT8 để suy luận trên CPU:
+
+```powershell
+# Mô hình .pt đầu ra là artifact deploy CPU, không dùng để tiếp tục train.
+python convert_int8.py `
+  --config_file configs/person/vit_clipreid.yml `
+  --weight output/it_qat/ViT-B-16_qat_5.pth `
+  --output output/it_qat/ViT-B-16_int8.pt
+```
+
+6. Benchmark công bằng FP32, QAT và INT8 trên cùng validation loader. JSON/CSV có hàng `record_type=comparison` để đọc trực tiếp speedup INT8 so với FP32.
+
+```powershell
+# Benchmark CPU: thử batch size 1, 8, 16 với 1 hoặc 4 CPU threads.
+python benchmark_quantized_reid.py `
+  --config_file configs/person/vit_clipreid.yml `
+  --fp32_weight output/it_qat/ViT-B-16_fp32_40.pth `
+  --qat_weight output/it_qat/ViT-B-16_qat_5.pth `
+  --int8_model output/it_qat/ViT-B-16_int8.pt `
+  --batch_sizes 1,8,16 `
+  --num_threads 1,4 `
+  --warmup_batches 20 `
+  --repeat 5 `
+  --output output/it_qat/benchmark_quantized_reid.json
+```
+
+Kết quả benchmark là `output/it_qat/benchmark_quantized_reid.json` và `output/it_qat/benchmark_quantized_reid.csv`. Thư mục `output/` bị bỏ qua bởi Git để không đẩy checkpoint hay kết quả chạy lên repository.
+
 ### Training
 
 Before training, update the dataset and output path in the config file that you want to use. For example, for Market-1501:
@@ -100,12 +172,12 @@ Important flow:
 train FP32 model -> load checkpoint -> patch QAT modules -> calibrate observers -> QAT finetune -> save QAT checkpoint
 ```
 
-Do not train from scratch with `MODEL.QAT.ENABLED: True` when loading an old FP32 checkpoint directly, because QAT modules use different `state_dict` keys. The script `quantize_fineturn.py` handles the correct order automatically.
+Do not train from scratch with `MODEL.QAT.ENABLED: True` when loading an old FP32 checkpoint directly, because QAT modules use different `state_dict` keys. The script `quantize_finetune.py` handles the correct order automatically.
 
 Example for ViT CLIP-ReID on Market-1501:
 
 ```
-CUDA_VISIBLE_DEVICES=0 python quantize_fineturn.py \
+CUDA_VISIBLE_DEVICES=0 python quantize_finetune.py \
   --config_file configs/person/vit_clipreid.yml \
   --weight output/market1501_vit_qat/ViT-B-16_fp32_60.pth \
   --qat_epochs 5 \
@@ -117,7 +189,7 @@ Windows PowerShell:
 
 ```
 $env:CUDA_VISIBLE_DEVICES="0"
-python quantize_fineturn.py `
+python quantize_finetune.py `
   --config_file configs/person/vit_clipreid.yml `
   --weight output/market1501_vit_qat/ViT-B-16_fp32_60.pth `
   --qat_epochs 5 `
@@ -132,9 +204,7 @@ Useful QAT options:
 --qat_epochs                   number of QAT finetuning epochs
 --qat_lr                       small learning rate for QAT, default 1e-6
 --calib_batches                batches used to calibrate observers before finetuning
---disable_observer_epoch       epoch to freeze observer scale/zero-point
---quantize_attention_internals optionally quantize attention matmul internals
---eval_before                  evaluate after QAT patch/calibration and before finetuning
+--local_rank                   GPU rank; leave at 0 for a single-GPU run
 ```
 
 Recommended config values for QAT are already present in the CLIP-ReID config files:
@@ -147,7 +217,7 @@ MODEL:
     DISABLE_OBSERVER_EPOCH: 2
 ```
 
-`MODEL.QAT.ENABLED` is kept `False` in the YAML files so normal FP32 checkpoints can be loaded safely. `quantize_fineturn.py` turns it on only after the FP32 checkpoint has been loaded and the QAT modules have been patched.
+`MODEL.QAT.ENABLED` is kept `False` in the YAML files so normal FP32 checkpoints can be loaded safely. `quantize_finetune.py` turns it on only after the FP32 checkpoint has been loaded and the QAT modules have been patched.
 
 QAT checkpoints are saved with `_qat_` in the filename, for example:
 
@@ -190,6 +260,23 @@ Notes:
 - LayerNorm, embeddings, projection parameters, softmax, and sensitive attention pieces stay FP32.
 - If the QAT checkpoint was trained with `--quantize_attention_internals`, pass the same option to `convert_int8.py`.
 
+### Benchmark FP32 vs QAT vs INT8
+
+`benchmark_quantized_reid.py` evaluates retrieval quality and CPU latency on the same validation loader. It writes the requested JSON plus a CSV next to it. The CSV contains accuracy rows, per-model performance rows, and `comparison` rows with `latency_speedup_x`, `latency_reduction_percent`, and `throughput_speedup_x` for INT8 versus FP32.
+
+Linux:
+
+```
+python benchmark_quantized_reid.py \
+  --config_file configs/person/vit_clipreid.yml \
+  --fp32_weight output/it_qat/ViT-B-16_fp32_40.pth \
+  --qat_weight output/it_qat/ViT-B-16_qat_5.pth \
+  --int8_model output/it_qat/ViT-B-16_int8.pt \
+  --output output/it_qat/benchmark_quantized_reid.json
+```
+
+For a short CPU smoke test, add `--batch_sizes 1 --num_threads 1 --warmup_batches 2 --repeat 1`.
+
 ### Evaluation
 
 For example, if you want to test ViT-based CLIP-ReID for MSMT17
@@ -198,7 +285,7 @@ For example, if you want to test ViT-based CLIP-ReID for MSMT17
 CUDA_VISIBLE_DEVICES=0 python test_clipreid.py --config_file configs/person/vit_clipreid.yml TEST.WEIGHT 'your_trained_checkpoints_path/ViT-B-16_fp32_60.pth'
 ```
 
-For a QAT checkpoint produced by `quantize_fineturn.py`, run evaluation with the same config and the saved QAT weight:
+For a QAT checkpoint produced by `quantize_finetune.py`, run evaluation with the same config and the saved QAT weight:
 
 ```
 CUDA_VISIBLE_DEVICES=0 python test_clipreid.py --config_file configs/person/vit_clipreid.yml TEST.WEIGHT 'your_qat_checkpoint_path/ViT-B-16_qat_5.pth' MODEL.QAT.ENABLED True
